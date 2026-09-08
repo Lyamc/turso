@@ -423,6 +423,47 @@ EOF
 
 </details>
 
+## Building from source
+
+Turso uses [Rust](https://rustup.rs/) 1.88 (see `rust-toolchain.toml`). A normal build uses the default LLVM backend:
+
+```shell
+cargo build
+cargo test -p turso_core
+```
+
+### Optional Cranelift backend
+
+You can also compile with the [Cranelift](https://github.com/rust-lang/rustc_codegen_cranelift) codegen backend (nightly only). This is useful for faster debug builds on supported targets:
+
+```shell
+# Linux / macOS
+bash scripts/build-cranelift.sh -p turso_core
+
+# Windows (PowerShell, MSVC host)
+powershell -File scripts/build-cranelift.ps1 -p turso_core
+```
+
+Cranelift is available on Linux, macOS, and Windows MSVC hosts. Windows GNU and gnullvm hosts use LLVM only.
+
+### Windows targets
+
+CI checks these Windows triples:
+
+| Target | Toolchain | Codegen backend |
+|--------|-----------|-----------------|
+| `x86_64-pc-windows-msvc` | MSVC | LLVM (default) and Cranelift |
+| `x86_64-pc-windows-gnu` | MinGW | LLVM |
+| `x86_64-pc-windows-gnullvm` | LLVM + MinGW (gnullvm) | LLVM |
+
+Cross-check a specific target:
+
+```shell
+cargo check --target x86_64-pc-windows-gnullvm -p turso_core
+```
+
+The C API binding compiles a small C helper (`varargs.c`) via the platform C compiler during the build. No `libc` or `cc` crate is required at build time.
+
 ## Contributing
 
 We'd love to have you contribute to Turso Database! Please check out the [contribution guide] to get started.
