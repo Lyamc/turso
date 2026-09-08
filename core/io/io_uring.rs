@@ -39,6 +39,12 @@ const IOVEC_POOL_SIZE: usize = 64;
 /// IOV_MAX is typically 1024
 const MAX_IOVEC_ENTRIES: usize = CKPT_BATCH_PAGES;
 
+#[repr(C)]
+struct Iovec {
+    iov_base: *mut std::ffi::c_void,
+    iov_len: usize,
+}
+
 /// Maximum number of I/O operations to wait for in a single run,
 /// waiting for > 1 can reduce the amount of `io_uring_enter` syscalls we
 /// make, but can increase single operation latency.
@@ -160,7 +166,7 @@ impl RingState {
 
 /// preallocated vec of iovec arrays to avoid allocations during writev operations
 struct IovecPool {
-    pool: Vec<Box<[libc::iovec; MAX_IOVEC_ENTRIES]>>,
+    pool: Vec<Box<[Iovec; MAX_IOVEC_ENTRIES]>>,
 }
 
 impl IovecPool {
@@ -168,7 +174,7 @@ impl IovecPool {
         let pool = (0..IOVEC_POOL_SIZE)
             .map(|_| {
                 Box::new(
-                    [libc::iovec {
+                    [Iovec {
                         iov_base: std::ptr::null_mut(),
                         iov_len: 0,
                     }; MAX_IOVEC_ENTRIES],
@@ -179,12 +185,12 @@ impl IovecPool {
     }
 
     #[inline(always)]
-    fn acquire(&mut self) -> Option<Box<[libc::iovec; MAX_IOVEC_ENTRIES]>> {
+    fn acquire(&mut self) -> Option<Box<[Iovec; MAX_IOVEC_ENTRIES]>> {
         self.pool.pop()
     }
 
     #[inline(always)]
-    fn release(&mut self, iovec: Box<[libc::iovec; MAX_IOVEC_ENTRIES]>) {
+    fn release(&mut self, iovec: Box<[Iovec; MAX_IOVEC_ENTRIES]>) {
         if self.pool.len() < IOVEC_POOL_SIZE {
             self.pool.push(iovec);
         }
@@ -253,7 +259,7 @@ struct WritevState {
     /// buffers to write
     bufs: Vec<Arc<crate::Buffer>>,
     /// we keep the last iovec allocation alive until final CQE
-    last_iov_allocation: Option<Box<[libc::iovec; MAX_IOVEC_ENTRIES]>>,
+    last_iov_allocation: Option<Box<[Iovec; MAX_IOVEC_ENTRIES]>>,
 }
 
 impl WritevState {
@@ -327,7 +333,7 @@ impl RingState {
 
         let mut iov_allocation = self.iov_pool.acquire().unwrap_or_else(|| {
             Box::new(
-                [libc::iovec {
+                [Iovec {
                     iov_base: std::ptr::null_mut(),
                     iov_len: 0,
                 }; MAX_IOVEC_ENTRIES],
@@ -355,7 +361,7 @@ impl RingState {
                     continue;
                 }
             }
-            iov_allocation[iov_count] = libc::iovec {
+            iov_allocation[iov_count] = Iovec {
                 iov_base: ptr as *mut _,
                 iov_len: len,
             };
@@ -366,7 +372,7 @@ impl RingState {
             }
         }
 
-        let ptr = iov_allocation.as_ptr() as *mut libc::iovec;
+        let ptr = iov_allocation.as_ptr() as *mut Iovec;
         st.last_iov_allocation = Some(iov_allocation);
         let entry = io_uring::opcode::Writev::new(st.file_id, ptr, iov_count as u32)
             .offset(st.file_pos)
@@ -566,8 +572,8 @@ impl IO for UringIO {
                 .submitter()
                 .register_buffers_update(
                     slot as u32,
-                    &[libc::iovec {
-                        iov_base: ptr.as_ptr() as *mut libc::c_void,
+                    &[Iovec {
+                        iov_base: ptr.as_ptr() as *mut std::ffi::c_void,
                         iov_len: len,
                     }],
                     None,

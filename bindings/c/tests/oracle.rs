@@ -48,6 +48,7 @@ macro_rules! api_table {
     ($( $name:ident : $ty:ty ),+ $(,)?) => {
         struct Api {
             label: &'static str,
+            _library: libloading::Library,
             $( $name: $ty, )+
         }
 
@@ -56,30 +57,20 @@ macro_rules! api_table {
             /// `path` must name a library exporting the sqlite3 C API with
             /// the standard signatures.
             unsafe fn load(label: &'static str, path: &str) -> Api {
-                let cpath = CString::new(path).unwrap();
-                let handle = libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
-                if handle.is_null() {
-                    let err = libc::dlerror();
-                    let err = if err.is_null() {
-                        "unknown".to_string()
-                    } else {
-                        CStr::from_ptr(err).to_string_lossy().into_owned()
-                    };
+                let library = libloading::Library::new(path).unwrap_or_else(|err| {
                     panic!("dlopen({path}) failed: {err}");
-                }
-                #[allow(unused_assignments)]
-                let mut sym: *mut c_void = std::ptr::null_mut();
+                });
                 $(
-                    let cname = CString::new(stringify!($name)).unwrap();
-                    sym = libc::dlsym(handle, cname.as_ptr());
-                    assert!(
-                        !sym.is_null(),
-                        "{label}: symbol {} not exported by {path}",
-                        stringify!($name)
-                    );
-                    let $name: $ty = std::mem::transmute(sym);
+                    let $name: $ty = *library
+                        .get(stringify!($name).as_bytes())
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "{label}: symbol {} not exported by {path}: {err}",
+                                stringify!($name)
+                            );
+                        });
                 )+
-                Api { label, $( $name, )+ }
+                Api { label, _library: library, $( $name, )+ }
             }
         }
     };

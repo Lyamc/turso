@@ -1,5 +1,5 @@
 use std::{
-    os::{fd::AsRawFd, unix::fs::FileExt},
+    os::unix::fs::FileExt,
     sync::{Arc, RwLock},
 };
 
@@ -120,54 +120,35 @@ impl File for SparseLinuxFile {
     }
 
     fn has_hole(&self, pos: usize, len: usize) -> turso_core::Result<bool> {
+        use rustix::fs::{lseek, SeekFrom};
+        use rustix::io::Errno;
+
         let file = self.file.read().unwrap();
-        // SEEK_DATA: Adjust the file offset to the next location in the file
-        // greater than or equal to offset containing data.  If offset
-        // points to data, then the file offset is set to offset
-        // (see https://man7.org/linux/man-pages/man2/lseek.2.html#DESCRIPTION)
-        let res = unsafe { libc::lseek(file.as_raw_fd(), pos as i64, libc::SEEK_DATA) };
-        if res == -1 {
-            let errno = unsafe { *libc::__errno_location() };
-            if errno == libc::ENXIO {
-                // ENXIO: whence is SEEK_DATA or SEEK_HOLE, and offset is beyond the
-                // end of the file, or whence is SEEK_DATA and offset is
-                // within a hole at the end of the file.
-                // (see https://man7.org/linux/man-pages/man2/lseek.2.html#ERRORS)
-                return Ok(true);
-            } else {
-                return Err(turso_core::LimboError::CompletionError(
-                    turso_core::CompletionError::IOError(
-                        std::io::Error::from_raw_os_error(errno).kind(),
-                        "lseek",
-                    ),
-                ));
-            }
+        match lseek(&*file, SeekFrom::Data(pos as u64)) {
+            Ok(next_data) => Ok(next_data as usize >= pos + len),
+            Err(Errno::NXIO) => Ok(true),
+            Err(err) => Err(turso_core::LimboError::CompletionError(
+                turso_core::CompletionError::IOError(std::io::Error::from(err).kind(), "lseek"),
+            )),
         }
-        // lseek succeeded - the hole is here if next data is strictly before pos + len - 1 (the last byte of the checked region
-        Ok(res as usize >= pos + len)
     }
 
     fn punch_hole(&self, pos: usize, len: usize) -> turso_core::Result<()> {
+        use rustix::fs::{fallocate, FallocateFlags};
+
         let file = self.file.write().unwrap();
-        let res = unsafe {
-            libc::fallocate(
-                file.as_raw_fd(),
-                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                pos as i64,
-                len as i64,
-            )
-        };
-        if res == -1 {
-            let errno = unsafe { *libc::__errno_location() };
-            Err(turso_core::LimboError::CompletionError(
-                turso_core::CompletionError::IOError(
-                    std::io::Error::from_raw_os_error(errno).kind(),
-                    "fallocate",
-                ),
+        fallocate(
+            &*file,
+            FallocateFlags::PUNCH_HOLE | FallocateFlags::KEEP_SIZE,
+            pos as u64,
+            len as u64,
+        )
+        .map_err(|err| {
+            turso_core::LimboError::CompletionError(turso_core::CompletionError::IOError(
+                std::io::Error::from(err).kind(),
+                "fallocate",
             ))
-        } else {
-            Ok(())
-        }
+        })
     }
 }
 

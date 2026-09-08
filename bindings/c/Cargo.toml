@@ -23,7 +23,6 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 env_logger = { workspace = true, default-features = false }
-libc = "0.2.169"
 turso_core = { workspace = true, features = ["conn_raw_api"] }
 turso_ext.workspace = true
 tracing = { workspace = true }
@@ -32,6 +31,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+libloading = "0.8.6"
 
 [package.metadata.capi.header]
 name = "sqlite3.h"
@@ -45,5 +45,4 @@ name = "oracle"
 path = "tests/oracle.rs"
 
 [build-dependencies]
-cc = "1"
 vcpkg = "0.2.15"

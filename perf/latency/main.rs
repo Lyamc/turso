@@ -503,6 +503,13 @@ struct DiskStats {
     busy_ms: u64,
 }
 
+#[cfg(target_os = "linux")]
+fn linux_device_major_minor(dev: u64) -> (u32, u32) {
+    let major = ((dev >> 8) & 0xfff) as u32 | ((dev >> 32) & !0xfff) as u32;
+    let minor = (dev & 0xff) as u32 | ((dev >> 12) & !0xff) as u32;
+    (major, minor)
+}
+
 impl DiskStats {
     #[cfg(not(target_os = "linux"))]
     fn for_path(_path: &std::path::Path) -> Option<DiskStats> {
@@ -513,7 +520,7 @@ impl DiskStats {
     fn for_path(path: &std::path::Path) -> Option<DiskStats> {
         use std::os::unix::fs::MetadataExt;
         let dev = std::fs::metadata(path).ok()?.dev();
-        let (major, minor) = (libc::major(dev), libc::minor(dev));
+        let (major, minor) = linux_device_major_minor(dev);
         let stats = std::fs::read_to_string("/proc/diskstats").ok()?;
         stats.lines().find_map(|line| {
             let f: Vec<&str> = line.split_whitespace().collect();
@@ -622,18 +629,40 @@ impl CpuTime {
 
     #[cfg(unix)]
     fn now() -> Option<CpuTime> {
-        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-        // SAFETY: RUSAGE_SELF is always valid and getrusage fills the struct on
-        // success, which is the only way it returns zero.
-        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
-        assert_eq!(rc, 0, "getrusage failed");
-        let usage = unsafe { usage.assume_init() };
-        let duration = |t: libc::timeval| Duration::new(t.tv_sec as u64, (t.tv_usec as u32) * 1000);
-        Some(CpuTime {
-            user: duration(usage.ru_utime),
-            system: duration(usage.ru_stime),
-        })
+        cpu_time_from_getrusage()
     }
+}
+
+#[cfg(unix)]
+fn cpu_time_from_getrusage() -> Option<CpuTime> {
+    #[repr(C)]
+    struct Timeval {
+        tv_sec: i64,
+        tv_usec: i64,
+    }
+    #[repr(C)]
+    struct RUsage {
+        ru_utime: Timeval,
+        ru_stime: Timeval,
+    }
+
+    extern "C" {
+        fn getrusage(who: i32, usage: *mut RUsage) -> i32;
+    }
+
+    let mut usage = std::mem::MaybeUninit::<RUsage>::uninit();
+    // SAFETY: RUSAGE_SELF is always valid and getrusage fills the struct on success.
+    let rc = unsafe { getrusage(0, usage.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    let duration =
+        |t: Timeval| Duration::new(t.tv_sec.max(0) as u64, (t.tv_usec.max(0) as u32) * 1000);
+    Some(CpuTime {
+        user: duration(usage.ru_utime),
+        system: duration(usage.ru_stime),
+    })
 }
 
 impl std::ops::Sub for CpuTime {

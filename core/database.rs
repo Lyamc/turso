@@ -2589,18 +2589,18 @@ impl Database {
         target_pointer_width = "64",
         any(target_os = "linux", target_os = "android")
     ))]
-    pub(crate) fn filesystem_magic_allows_shared_wal(filesystem_magic: libc::c_long) -> bool {
-        const AFS_SUPER_MAGIC: libc::c_long = 0x5346_414f;
-        const CIFS_SUPER_MAGIC: libc::c_long = 0xFF53_4D42u32 as libc::c_long;
-        const CODA_SUPER_MAGIC: libc::c_long = 0x7375_7245;
-        const CEPH_SUPER_MAGIC: libc::c_long = 0x00C3_6400;
-        const GFS2_SUPER_MAGIC: libc::c_long = 0x0116_1970;
-        const LUSTRE_SUPER_MAGIC: libc::c_long = 0x0BD0_0BD0;
-        const NCP_SUPER_MAGIC: libc::c_long = 0x564c;
-        const NFS_SUPER_MAGIC: libc::c_long = 0x6969;
-        const OCFS2_SUPER_MAGIC: libc::c_long = 0x7461_636f;
-        const SMB2_SUPER_MAGIC: libc::c_long = 0xFE53_4D42u32 as libc::c_long;
-        const V9FS_SUPER_MAGIC: libc::c_long = 0x0102_1997;
+    pub(crate) fn filesystem_magic_allows_shared_wal(filesystem_magic: i64) -> bool {
+        const AFS_SUPER_MAGIC: i64 = 0x5346_414f;
+        const CIFS_SUPER_MAGIC: i64 = 0xFF53_4D42u32 as i64;
+        const CODA_SUPER_MAGIC: i64 = 0x7375_7245;
+        const CEPH_SUPER_MAGIC: i64 = 0x00C3_6400;
+        const GFS2_SUPER_MAGIC: i64 = 0x0116_1970;
+        const LUSTRE_SUPER_MAGIC: i64 = 0x0BD0_0BD0;
+        const NCP_SUPER_MAGIC: i64 = 0x564c;
+        const NFS_SUPER_MAGIC: i64 = 0x6969;
+        const OCFS2_SUPER_MAGIC: i64 = 0x7461_636f;
+        const SMB2_SUPER_MAGIC: i64 = 0xFE53_4D42u32 as i64;
+        const V9FS_SUPER_MAGIC: i64 = 0x0102_1997;
 
         !matches!(
             filesystem_magic,
@@ -2624,9 +2624,6 @@ impl Database {
         any(target_os = "linux", target_os = "android")
     ))]
     pub(crate) fn path_allows_shared_wal_coordination(path: &Path) -> Result<bool> {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
         let probe_path = if path.exists() {
             path
         } else {
@@ -2634,24 +2631,13 @@ impl Database {
                 .filter(|parent| !parent.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."))
         };
-        let c_path = CString::new(probe_path.as_os_str().as_bytes()).map_err(|_| {
-            LimboError::InvalidArgument(format!(
-                "path contains interior NUL bytes: {}",
-                probe_path.display()
-            ))
-        })?;
-        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-        let rc = unsafe { libc::statfs(c_path.as_ptr(), stat.as_mut_ptr()) };
-        if rc != 0 {
-            return Err(io_error(
-                std::io::Error::last_os_error(),
+        let stat = rustix::fs::statfs(probe_path).map_err(|err| {
+            io_error(
+                std::io::Error::from(err),
                 "statfs shared WAL coordination path",
-            ));
-        }
-        let stat = unsafe { stat.assume_init() };
-        Ok(Self::filesystem_magic_allows_shared_wal(
-            stat.f_type as libc::c_long,
-        ))
+            )
+        })?;
+        Ok(Self::filesystem_magic_allows_shared_wal(stat.f_type as i64))
     }
 
     #[cfg(all(
@@ -2660,9 +2646,6 @@ impl Database {
         not(any(target_os = "linux", target_os = "android"))
     ))]
     pub(crate) fn path_allows_shared_wal_coordination(path: &Path) -> Result<bool> {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
         let probe_path = if path.exists() {
             path
         } else {
@@ -2670,21 +2653,12 @@ impl Database {
                 .filter(|parent| !parent.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."))
         };
-        let c_path = CString::new(probe_path.as_os_str().as_bytes()).map_err(|_| {
-            LimboError::InvalidArgument(format!(
-                "path contains interior NUL bytes: {}",
-                probe_path.display()
-            ))
-        })?;
-        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-        let rc = unsafe { libc::statfs(c_path.as_ptr(), stat.as_mut_ptr()) };
-        if rc != 0 {
-            return Err(io_error(
-                std::io::Error::last_os_error(),
+        let stat = rustix::fs::statfs(probe_path).map_err(|err| {
+            io_error(
+                std::io::Error::from(err),
                 "statfs shared WAL coordination path",
-            ));
-        }
-        let stat = unsafe { stat.assume_init() };
+            )
+        })?;
         // macOS and other BSDs expose the filesystem type as a
         // null-terminated string in f_fstypename rather than an
         // integer magic number.

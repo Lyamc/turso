@@ -12,4 +12,3 @@ turso = { workspace = true }
 rusqlite = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, default-features = true, features = ["full"] }
-libc = "0.2"

@@ -410,58 +410,31 @@ impl TerminalDetector {
     }
 
     /// Save current terminal settings
-    fn save_terminal_settings() -> Option<libc::termios> {
-        use std::os::unix::io::AsRawFd;
+    fn save_terminal_settings() -> Option<rustix::termios::Termios> {
+        use rustix::stdio::stdin;
+        use rustix::termios::tcgetattr;
 
-        let stdin_fd = io::stdin().as_raw_fd();
-        let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
-
-        unsafe {
-            if libc::tcgetattr(stdin_fd, &mut termios) == 0 {
-                Some(termios)
-            } else {
-                None
-            }
-        }
+        tcgetattr(stdin()).ok()
     }
 
     /// Set terminal to raw mode
     fn set_raw_mode() -> Option<()> {
-        use std::os::unix::io::AsRawFd;
+        use rustix::stdio::stdin;
+        use rustix::termios::{tcgetattr, tcsetattr, OptionalActions, SpecialCodeIndex};
 
-        let stdin_fd = io::stdin().as_raw_fd();
-        let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
-
-        unsafe {
-            if libc::tcgetattr(stdin_fd, &mut termios) != 0 {
-                return None;
-            }
-
-            // Set raw mode: disable canonical mode, echo, and signals
-            termios.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
-            termios.c_iflag &= !(libc::IXON | libc::ICRNL);
-            termios.c_oflag &= !libc::OPOST;
-
-            // Set minimum characters to read and timeout
-            termios.c_cc[libc::VMIN] = 0;
-            termios.c_cc[libc::VTIME] = 1; // 0.1 second timeout
-
-            if libc::tcsetattr(stdin_fd, libc::TCSANOW, &termios) == 0 {
-                Some(())
-            } else {
-                None
-            }
-        }
+        let mut termios = tcgetattr(stdin()).ok()?;
+        termios.make_raw();
+        termios.special_codes[SpecialCodeIndex::VMIN] = 0;
+        termios.special_codes[SpecialCodeIndex::VTIME] = 1;
+        tcsetattr(stdin(), OptionalActions::Now, &termios).ok()
     }
 
     /// Restore terminal settings
-    fn restore_terminal_settings(original: &libc::termios) {
-        use std::os::unix::io::AsRawFd;
+    fn restore_terminal_settings(original: &rustix::termios::Termios) {
+        use rustix::stdio::stdin;
+        use rustix::termios::{tcsetattr, OptionalActions};
 
-        let stdin_fd = io::stdin().as_raw_fd();
-        unsafe {
-            libc::tcsetattr(stdin_fd, libc::TCSANOW, original);
-        }
+        let _ = tcsetattr(stdin(), OptionalActions::Now, original);
     }
 
     /// Send background color query and read response

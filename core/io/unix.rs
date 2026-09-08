@@ -5,9 +5,14 @@ use crate::io::common;
 use crate::io::FileSyncType;
 use crate::Result;
 use rustix::{
-    fd::{AsFd, AsRawFd},
+    fd::{AsFd, AsRawFd, BorrowedFd},
     fs::{self, FlockOperation},
+    io::{self, IoSlice},
+    mm::{self, MapFlags, ProtFlags},
+    param,
+    process::{FlockOffsetType, FlockType},
 };
+use std::ffi::c_void;
 use std::os::fd::RawFd;
 use std::ptr::NonNull;
 
@@ -21,6 +26,63 @@ use tracing::{instrument, trace, Level};
 const MAX_PWRITE_LEN: usize = i32::MAX as usize;
 
 const MAX_IOV: usize = 1024;
+
+#[repr(C)]
+struct Iovec {
+    iov_base: *mut c_void,
+    iov_len: usize,
+}
+
+#[repr(C)]
+struct RawFlock {
+    l_type: i16,
+    l_whence: i16,
+    l_start: i64,
+    l_len: i64,
+    l_pid: i32,
+    #[cfg(target_os = "freebsd")]
+    l_sysid: i32,
+}
+
+#[cfg(target_os = "linux")]
+mod fcntl_cmd {
+    pub const F_SETLK: i32 = 6;
+    pub const F_SETLKW: i32 = 7;
+    pub const F_OFD_SETLK: i32 = 37;
+    pub const F_OFD_SETLKW: i32 = 38;
+}
+
+#[cfg(not(target_os = "linux"))]
+mod fcntl_cmd {
+    pub const F_SETLK: i32 = 8;
+    pub const F_SETLKW: i32 = 9;
+}
+
+extern "C" {
+    fn fcntl(fd: std::os::raw::c_int, cmd: std::os::raw::c_int, lock: *mut RawFlock)
+        -> std::os::raw::c_int;
+}
+
+fn fcntl_flock(fd: RawFd, cmd: i32, lock: &mut RawFlock) -> io::Result<()> {
+    let rc = unsafe { fcntl(fd, cmd, lock) };
+    if rc == -1 {
+        Err(io::Errno::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn raw_flock(offset: u64, len: i64, typ: FlockType) -> RawFlock {
+    RawFlock {
+        l_type: typ as i16,
+        l_whence: FlockOffsetType::Set as i16,
+        l_start: offset as i64,
+        l_len: len,
+        l_pid: 0,
+        #[cfg(target_os = "freebsd")]
+        l_sysid: 0,
+    }
+}
 
 pub struct UnixIO {}
 
@@ -110,13 +172,13 @@ impl SharedWalMappedRegion for UnixSharedWalMapping {
 
 impl Drop for UnixSharedWalMapping {
     fn drop(&mut self) {
-        let rc = unsafe { libc::munmap(self.mapping_ptr.as_ptr().cast(), self.mapping_len) };
-        if rc != 0 {
+        if let Err(err) = unsafe { mm::munmap(self.mapping_ptr.as_ptr().cast(), self.mapping_len) }
+        {
             // Log rather than panic — panicking in Drop aborts if we're already
             // unwinding (double panic).
             tracing::error!(
                 "munmap failed for shared WAL coordination region: {}",
-                std::io::Error::last_os_error()
+                std::io::Error::from(err)
             );
         }
     }
@@ -129,26 +191,19 @@ pub(crate) fn unix_shared_wal_lock_byte(
     blocking: bool,
     kind: SharedWalLockKind,
 ) -> Result<bool> {
-    let mut flock = libc::flock {
-        l_type: if exclusive {
-            libc::F_WRLCK as libc::c_short
-        } else {
-            libc::F_RDLCK as libc::c_short
-        },
-        l_whence: libc::SEEK_SET as libc::c_short,
-        l_start: offset as libc::off_t,
-        l_len: 1,
-        l_pid: 0,
-        #[cfg(target_os = "freebsd")]
-        l_sysid: 0,
+    let typ = if exclusive {
+        FlockType::WriteLock
+    } else {
+        FlockType::ReadLock
     };
+    let mut flock = raw_flock(offset, 1, typ);
     let cmd = match (kind, blocking) {
         #[cfg(target_os = "linux")]
-        (SharedWalLockKind::LinuxOfd, true) => libc::F_OFD_SETLKW,
+        (SharedWalLockKind::LinuxOfd, true) => fcntl_cmd::F_OFD_SETLKW,
         #[cfg(target_os = "linux")]
-        (SharedWalLockKind::LinuxOfd, false) => libc::F_OFD_SETLK,
-        (SharedWalLockKind::ProcessScopedFcntl, true) => libc::F_SETLKW,
-        (SharedWalLockKind::ProcessScopedFcntl, false) => libc::F_SETLK,
+        (SharedWalLockKind::LinuxOfd, false) => fcntl_cmd::F_OFD_SETLK,
+        (SharedWalLockKind::ProcessScopedFcntl, true) => fcntl_cmd::F_SETLKW,
+        (SharedWalLockKind::ProcessScopedFcntl, false) => fcntl_cmd::F_SETLK,
         #[cfg(not(target_os = "linux"))]
         (SharedWalLockKind::LinuxOfd, _) => {
             return Err(LimboError::InternalError(
@@ -157,25 +212,24 @@ pub(crate) fn unix_shared_wal_lock_byte(
         }
     };
     loop {
-        let rc = unsafe { libc::fcntl(fd, cmd, &mut flock) };
-        if rc == -1 {
-            let error = std::io::Error::last_os_error();
-            if blocking && error.kind() == ErrorKind::Interrupted {
-                continue;
-            }
-            if !blocking && error.kind() == ErrorKind::WouldBlock {
+        match fcntl_flock(fd, cmd, &mut flock) {
+            Ok(()) => return Ok(true),
+            Err(err) if blocking && err == io::Errno::INTR => continue,
+            Err(err) if !blocking && (err == io::Errno::AGAIN || err == io::Errno::ACCESS) => {
                 return Ok(false);
             }
-            let message = match error.kind() {
-                ErrorKind::WouldBlock => {
-                    "Failed locking shared WAL coordination file. File is locked by another process"
-                        .to_string()
-                }
-                _ => format!("Failed locking shared WAL coordination file, {error}"),
-            };
-            return Err(LimboError::LockingError(message));
+            Err(err) => {
+                let error = std::io::Error::from(err);
+                let message = match error.kind() {
+                    ErrorKind::WouldBlock => {
+                        "Failed locking shared WAL coordination file. File is locked by another process"
+                            .to_string()
+                    }
+                    _ => format!("Failed locking shared WAL coordination file, {error}"),
+                };
+                return Err(LimboError::LockingError(message));
+            }
         }
-        return Ok(true);
     }
 }
 
@@ -184,19 +238,11 @@ pub(crate) fn unix_shared_wal_unlock_byte(
     offset: u64,
     kind: SharedWalLockKind,
 ) -> Result<()> {
-    let mut flock = libc::flock {
-        l_type: libc::F_UNLCK as libc::c_short,
-        l_whence: libc::SEEK_SET as libc::c_short,
-        l_start: offset as libc::off_t,
-        l_len: 1,
-        l_pid: 0,
-        #[cfg(target_os = "freebsd")]
-        l_sysid: 0,
-    };
+    let mut flock = raw_flock(offset, 1, FlockType::Unlocked);
     let cmd = match kind {
         #[cfg(target_os = "linux")]
-        SharedWalLockKind::LinuxOfd => libc::F_OFD_SETLK,
-        SharedWalLockKind::ProcessScopedFcntl => libc::F_SETLK,
+        SharedWalLockKind::LinuxOfd => fcntl_cmd::F_OFD_SETLK,
+        SharedWalLockKind::ProcessScopedFcntl => fcntl_cmd::F_SETLK,
         #[cfg(not(target_os = "linux"))]
         SharedWalLockKind::LinuxOfd => {
             return Err(LimboError::InternalError(
@@ -204,15 +250,12 @@ pub(crate) fn unix_shared_wal_unlock_byte(
             ))
         }
     };
-    let rc = unsafe { libc::fcntl(fd, cmd, &mut flock) };
-    if rc == -1 {
-        Err(LimboError::LockingError(format!(
+    fcntl_flock(fd, cmd, &mut flock).map_err(|err| {
+        LimboError::LockingError(format!(
             "Failed to release shared WAL coordination lock: {}",
-            std::io::Error::last_os_error()
-        )))
-    } else {
-        Ok(())
-    }
+            std::io::Error::from(err)
+        ))
+    })
 }
 
 pub(crate) fn unix_shared_wal_map(
@@ -225,43 +268,39 @@ pub(crate) fn unix_shared_wal_map(
             "cannot mmap shared WAL coordination region with zero length".into(),
         ));
     }
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if page_size <= 0 {
-        return Err(LimboError::LockingError(format!(
+    let page_size = param::page_size().map_err(|err| {
+        LimboError::LockingError(format!(
             "failed to determine shared WAL mmap page size: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let page_size = page_size as u64;
+            std::io::Error::from(err)
+        ))
+    })? as u64;
     let aligned_offset = offset / page_size * page_size;
     let prefix_len = (offset - aligned_offset) as usize;
     let mapping_len = prefix_len
         .checked_add(len)
         .ok_or_else(|| LimboError::InternalError("shared WAL mmap length overflow".into()))?;
     let mapping_ptr = unsafe {
-        libc::mmap(
+        mm::mmap(
             std::ptr::null_mut(),
             mapping_len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            fd,
-            aligned_offset as libc::off_t,
+            ProtFlags::READ | ProtFlags::WRITE,
+            MapFlags::SHARED,
+            BorrowedFd::borrow_raw(fd),
+            aligned_offset,
         )
     };
-    if mapping_ptr == libc::MAP_FAILED {
-        let error = std::io::Error::last_os_error();
-        let file_size = unsafe {
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            if libc::fstat(fd, stat.as_mut_ptr()) == 0 {
-                stat.assume_init().st_size
-            } else {
-                -1
-            }
-        };
-        return Err(LimboError::LockingError(format!(
-            "mmap shared WAL coordination file failed: {error} (offset={offset}, aligned_offset={aligned_offset}, len={len}, mapping_len={mapping_len}, fd={fd}, file_size={file_size})"
-        )));
-    }
+    let mapping_ptr = match mapping_ptr {
+        Ok(ptr) => ptr,
+        Err(err) => {
+            let error = std::io::Error::from(err);
+            let file_size = unsafe { fs::fstat(BorrowedFd::borrow_raw(fd)) }
+                .map(|stat| stat.st_size)
+                .unwrap_or(-1);
+            return Err(LimboError::LockingError(format!(
+                "mmap shared WAL coordination file failed: {error} (offset={offset}, aligned_offset={aligned_offset}, len={len}, mapping_len={mapping_len}, fd={fd}, file_size={file_size})"
+            )));
+        }
+    };
     let mapping_ptr =
         NonNull::new(mapping_ptr.cast::<u8>()).expect("mmap returned null for shared WAL map");
     let ptr = NonNull::new(unsafe { mapping_ptr.as_ptr().add(prefix_len) })
@@ -315,25 +354,16 @@ impl File for UnixFile {
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
-        let result = unsafe {
-            let r = c.as_read();
-            let buf = r.buf();
-            let slice = buf.as_mut_slice();
-            libc::pread(
-                self.file.as_raw_fd(),
-                slice.as_mut_ptr() as *mut libc::c_void,
-                slice.len(),
-                pos as libc::off_t,
-            )
-        };
-        if result == -1 {
-            let e = std::io::Error::last_os_error();
-            Err(io_error(e, "pread"))
-        } else {
-            trace!("pread n: {}", result);
-            // Read succeeded immediately
-            c.complete(result as i32);
-            Ok(c)
+        let r = c.as_read();
+        let buf = r.buf();
+        let slice = buf.as_mut_slice();
+        match io::pread(&self.file, slice, pos) {
+            Ok(n) => {
+                trace!("pread n: {}", n);
+                c.complete(n as i32);
+                Ok(c)
+            }
+            Err(err) => Err(io_error(std::io::Error::from(err), "pread")),
         }
     }
 
@@ -348,34 +378,21 @@ impl File for UnixFile {
         while total_written < total_size {
             let remaining_slice = &buf_slice[total_written..];
             let write_len = remaining_slice.len().min(MAX_PWRITE_LEN);
-            let result = unsafe {
-                libc::pwrite(
-                    self.file.as_raw_fd(),
-                    remaining_slice.as_ptr() as *const libc::c_void,
-                    write_len,
-                    current_pos as libc::off_t,
-                )
-            };
-            if result == -1 {
-                let e = std::io::Error::last_os_error();
-                if e.kind() == ErrorKind::Interrupted {
-                    // EINTR, retry without advancing
-                    continue;
+            match io::pwrite(&self.file, &remaining_slice[..write_len], current_pos) {
+                Ok(0) => {
+                    return Err(LimboError::CompletionError(CompletionError::IOError(
+                        ErrorKind::UnexpectedEof,
+                        "pwrite",
+                    )));
                 }
-                return Err(io_error(e, "pwrite"));
+                Ok(written) => {
+                    total_written += written;
+                    current_pos += written as u64;
+                    trace!("pwrite iteration: wrote {written}, total {total_written}/{total_size}");
+                }
+                Err(err) if err == io::Errno::INTR => continue,
+                Err(err) => return Err(io_error(std::io::Error::from(err), "pwrite")),
             }
-            let written = result as usize;
-            if written == 0 {
-                // Unexpected EOF for regular files
-                return Err(LimboError::CompletionError(CompletionError::IOError(
-                    ErrorKind::UnexpectedEof,
-                    "pwrite",
-                )));
-            }
-
-            total_written += written;
-            current_pos += written as u64;
-            trace!("pwrite iteration: wrote {written}, total {total_written}/{total_size}");
         }
         trace!("pwrite complete: wrote {total_written} bytes");
         c.complete(total_written as i32);
@@ -395,7 +412,7 @@ impl File for UnixFile {
         }
 
         let total_size: usize = buffers.iter().map(|b| b.as_slice().len()).sum();
-        let mut iov: Vec<libc::iovec> = Vec::with_capacity(MAX_IOV);
+        let mut iov: Vec<Iovec> = Vec::with_capacity(MAX_IOV);
         let mut buf_idx = 0;
         let mut buf_offset = 0;
         let mut total_written = 0usize;
@@ -419,32 +436,23 @@ impl File for UnixFile {
             if iov.is_empty() {
                 break;
             }
-            let n = unsafe {
-                libc::pwritev(
-                    self.file.as_raw_fd(),
-                    iov.as_ptr(),
-                    iov.len() as i32,
-                    current_pos as libc::off_t,
-                )
-            };
-            if n < 0 {
-                let e = std::io::Error::last_os_error();
-                if e.kind() == ErrorKind::Interrupted {
-                    continue;
+            let ioslices = iovec_to_io_slices(&iov);
+            match io::pwritev(&self.file, &ioslices, current_pos) {
+                Ok(0) => {
+                    return Err(LimboError::CompletionError(CompletionError::IOError(
+                        ErrorKind::UnexpectedEof,
+                        "pwritev",
+                    )));
                 }
-                return Err(io_error(e, "pwritev"));
+                Ok(written) => {
+                    total_written += written;
+                    current_pos += written as u64;
+                    trim_iovecs(&mut iov, written);
+                    trace!("pwritev iteration: wrote {written}, total {total_written}/{total_size}");
+                }
+                Err(err) if err == io::Errno::INTR => continue,
+                Err(err) => return Err(io_error(std::io::Error::from(err), "pwritev")),
             }
-            let written = n as usize;
-            if written == 0 {
-                return Err(LimboError::CompletionError(CompletionError::IOError(
-                    ErrorKind::UnexpectedEof,
-                    "pwritev",
-                )));
-            }
-            total_written += written;
-            current_pos += written as u64;
-            trim_iovecs(&mut iov, written);
-            trace!("pwritev iteration: wrote {written}, total {total_written}/{total_size}");
         }
         trace!("pwritev complete: wrote {total_written} bytes");
         c.complete(total_written as i32);
@@ -453,39 +461,30 @@ impl File for UnixFile {
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
-        let result = unsafe {
-            #[cfg(target_vendor = "apple")]
-            {
-                match sync_type {
-                    FileSyncType::Fsync => libc::fsync(self.file.as_raw_fd()),
-                    FileSyncType::FullFsync => {
-                        libc::fcntl(self.file.as_raw_fd(), libc::F_FULLFSYNC)
-                    }
-                }
+        #[cfg(target_vendor = "apple")]
+        {
+            match sync_type {
+                FileSyncType::Fsync => fs::fsync(&self.file).map_err(|err| {
+                    io_error(std::io::Error::from(err), "sync")
+                })?,
+                FileSyncType::FullFsync => fs::fcntl_fullfsync(&self.file).map_err(|err| {
+                    io_error(std::io::Error::from(err), "sync")
+                })?,
             }
-            #[cfg(not(target_vendor = "apple"))]
-            {
-                // FullFsync has no effect on non-Apple platforms
-                let _ = sync_type;
-                libc::fsync(self.file.as_raw_fd())
-            }
-        };
-
-        if result == -1 {
-            let e = std::io::Error::last_os_error();
-            Err(io_error(e, "sync"))
-        } else {
-            #[cfg(target_vendor = "apple")]
             match sync_type {
                 FileSyncType::FullFsync => trace!("fcntl(F_FULLFSYNC)"),
                 FileSyncType::Fsync => trace!("fsync"),
             }
-            #[cfg(not(target_vendor = "apple"))]
-            trace!("fsync");
-
-            c.complete(0);
-            Ok(c)
         }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = sync_type;
+            fs::fsync(&self.file).map_err(|err| io_error(std::io::Error::from(err), "sync"))?;
+            trace!("fsync");
+        }
+
+        c.complete(0);
+        Ok(c)
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
@@ -543,15 +542,25 @@ impl File for UnixFile {
     }
 }
 
+fn iovec_to_io_slices(iov: &[Iovec]) -> Vec<IoSlice<'_>> {
+    iov.iter()
+        .map(|entry| {
+            IoSlice::new(unsafe {
+                std::slice::from_raw_parts(entry.iov_base.cast::<u8>(), entry.iov_len)
+            })
+        })
+        .collect()
+}
+
 /// Append iovec entries for `buf` to `iovecs`, splitting `buf` into chunks of
 /// at most `MAX_PWRITE_LEN` bytes. Stops once `iovecs.len()` reaches `max_iovecs`.
 /// Returns the number of bytes consumed from `buf`.
-fn buf_to_iovecs(buf: &[u8], iovecs: &mut Vec<libc::iovec>, max_iovecs: usize) -> usize {
+fn buf_to_iovecs(buf: &[u8], iovecs: &mut Vec<Iovec>, max_iovecs: usize) -> usize {
     let mut slice = buf;
     while !slice.is_empty() && iovecs.len() < max_iovecs {
         let chunk_len = slice.len().min(MAX_PWRITE_LEN);
-        iovecs.push(libc::iovec {
-            iov_base: slice.as_ptr() as *mut libc::c_void,
+        iovecs.push(Iovec {
+            iov_base: slice.as_ptr().cast_mut().cast(),
             iov_len: chunk_len,
         });
         slice = &slice[chunk_len..];
@@ -561,7 +570,7 @@ fn buf_to_iovecs(buf: &[u8], iovecs: &mut Vec<libc::iovec>, max_iovecs: usize) -
 
 /// Drop the first `n` bytes from the front of `iov`, advancing the leading
 /// entry's pointer if a partial iovec was consumed.
-fn trim_iovecs(iov: &mut Vec<libc::iovec>, mut n: usize) {
+fn trim_iovecs(iov: &mut Vec<Iovec>, mut n: usize) {
     let mut idx = 0;
     while idx < iov.len() {
         if iov[idx].iov_len > n {
@@ -574,7 +583,7 @@ fn trim_iovecs(iov: &mut Vec<libc::iovec>, mut n: usize) {
     if n > 0 {
         assert!(!iov.is_empty());
         let front = &mut iov[0];
-        front.iov_base = unsafe { (front.iov_base as *mut u8).add(n) as *mut libc::c_void };
+        front.iov_base = unsafe { front.iov_base.cast::<u8>().add(n).cast() };
         front.iov_len -= n;
     }
 }

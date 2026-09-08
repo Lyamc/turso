@@ -346,14 +346,20 @@ fn next_shared_owner_instance_id() -> u32 {
 /// has been recycled by an unrelated process.
 #[cfg(unix)]
 fn pid_is_alive(pid: u32) -> bool {
+    use rustix::io::Errno;
+    use rustix::process::{test_kill_process, Pid};
+
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
     }
-    let rc = unsafe { libc::kill(pid as i32, 0) };
-    if rc == 0 {
-        return true;
+    let Some(pid) = Pid::from_raw(pid as i32) else {
+        return false;
+    };
+    match test_kill_process(pid) {
+        Ok(()) => true,
+        Err(Errno::PERM) => true,
+        Err(_) => false,
     }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(target_os = "windows")]
@@ -2961,16 +2967,13 @@ mod tests {
     fn exited_child_pid() -> u32 {
         #[cfg(unix)]
         {
-            let child = unsafe { libc::fork() };
-            assert!(child >= 0, "fork failed");
-            if child == 0 {
-                unsafe { libc::_exit(0) };
-            }
-            let mut status: libc::c_int = 0;
-            let waited = unsafe { libc::waitpid(child, &mut status, 0) };
-            assert_eq!(waited, child, "waitpid failed");
-            assert!(libc::WIFEXITED(status), "child did not exit cleanly");
-            child as u32
+            let mut child = std::process::Command::new("true")
+                .spawn()
+                .expect("spawn exited child");
+            let pid = child.id();
+            let status = child.wait().expect("wait exited child");
+            assert!(status.success(), "child did not exit cleanly");
+            pid
         }
 
         #[cfg(windows)]

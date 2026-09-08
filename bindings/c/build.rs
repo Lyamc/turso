@@ -1,16 +1,9 @@
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
 fn main() {
-    println!("cargo:rustc-link-search=native=target/debug");
     println!("cargo:rerun-if-changed=src/varargs.c");
-    // varargs.c exists because some sqlite3 entry points (db_config, and
-    // eventually mprintf/snprintf) are C-variadic, which stable Rust cannot
-    // define. Faking them with fixed args breaks on Apple arm64, where
-    // variadic arguments are passed on the stack but named arguments in
-    // registers — the callee would read garbage. The exported sqlite3_*
-    // symbols themselves are naked-function trampolines in lib.rs; see the
-    // comment there.
-    cc::Build::new()
-        .file("src/varargs.c")
-        .compile("turso_sqlite3_varargs");
+    compile_varargs();
     let profile_dir = target_profile_dir();
     println!("cargo:rustc-link-search=native={}", profile_dir.display());
 
@@ -19,8 +12,52 @@ fn main() {
     }
 }
 
-fn target_profile_dir() -> std::path::PathBuf {
-    let out_dir = std::path::PathBuf::from(
+fn compile_varargs() {
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let src = Path::new("src/varargs.c");
+    let is_msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+
+    if is_msvc {
+        let obj = out_dir.join("varargs.obj");
+        let lib = out_dir.join("turso_sqlite3_varargs.lib");
+        run(
+            Command::new(std::env::var("CC").unwrap_or_else(|_| "cl".into()))
+                .args(["/nologo", "/c", "/Fo"])
+                .arg(&obj)
+                .arg(src),
+        );
+        run(
+            Command::new(std::env::var("AR").unwrap_or_else(|_| "lib".into()))
+                .args(["/nologo", "/OUT:"])
+                .arg(&lib)
+                .arg(&obj),
+        );
+        println!("cargo:rustc-link-lib=static=turso_sqlite3_varargs");
+        println!("cargo:rustc-link-search=native={}", out_dir.display());
+    } else {
+        let obj = out_dir.join("varargs.o");
+        let lib = out_dir.join("libturso_sqlite3_varargs.a");
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+        run(Command::new(&cc).args(["-c", "-o"]).arg(&obj).arg(src));
+        let ar = std::env::var("AR").unwrap_or_else(|_| "ar".into());
+        run(Command::new(&ar).args(["rcs"]).arg(&lib).arg(&obj));
+        println!("cargo:rustc-link-lib=static=turso_sqlite3_varargs");
+        println!("cargo:rustc-link-search=native={}", out_dir.display());
+    }
+}
+
+fn run(command: &mut Command) {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let status = command.status().unwrap_or_else(|err| {
+        panic!("failed to run {program}: {err}");
+    });
+    if !status.success() {
+        panic!("{program} failed with {status}");
+    }
+}
+
+fn target_profile_dir() -> PathBuf {
+    let out_dir = PathBuf::from(
         std::env::var_os("OUT_DIR").expect("Cargo must set OUT_DIR for build scripts"),
     );
     out_dir

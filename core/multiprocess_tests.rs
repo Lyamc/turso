@@ -236,7 +236,7 @@ fn flip_db_header_reserved_byte(path: &std::path::Path) {
 fn shared_wal_coordination_rejects_remote_filesystem_magic_values() {
     assert!(!Database::filesystem_magic_allows_shared_wal(0x6969));
     assert!(!Database::filesystem_magic_allows_shared_wal(
-        0xFF53_4D42u32 as libc::c_long,
+        0xFF53_4D42u32 as i64,
     ));
     assert!(!Database::filesystem_magic_allows_shared_wal(0x0102_1997));
     assert!(Database::filesystem_magic_allows_shared_wal(0xEF53));
@@ -1757,7 +1757,7 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
     #[cfg(unix)]
     assert_eq!(
         child_status.signal(),
-        Some(libc::SIGKILL),
+        Some(rustix::process::Signal::KILL.as_raw()),
         "expected killed child process to exit via SIGKILL, got {child_status:?}"
     );
     #[cfg(windows)]

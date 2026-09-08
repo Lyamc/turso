@@ -441,34 +441,27 @@ impl Arena {
 
 #[cfg(all(unix, not(miri)))]
 mod arena {
-    use libc::MAP_ANONYMOUS;
-    use libc::{mmap, munmap, MAP_PRIVATE, PROT_READ, PROT_WRITE};
-    use std::ffi::c_void;
+    use rustix::mm::{madvise, mmap_anonymous, munmap, Advice, MapFlags, ProtFlags};
 
     pub unsafe fn alloc(len: usize) -> *mut u8 {
-        let ptr = mmap(
+        let ptr = mmap_anonymous(
             std::ptr::null_mut(),
             len,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS,
-            -1,
-            0,
-        );
-        if ptr == libc::MAP_FAILED {
-            panic!("mmap failed: {}", std::io::Error::last_os_error());
-        }
+            ProtFlags::READ | ProtFlags::WRITE,
+            MapFlags::PRIVATE,
+        )
+        .unwrap_or_else(|err| panic!("mmap failed: {}", std::io::Error::from(err)));
         #[cfg(target_os = "linux")]
         {
-            libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
+            madvise(ptr, len, Advice::LinuxHugepage)
+                .unwrap_or_else(|err| panic!("madvise failed: {}", std::io::Error::from(err)));
         }
         ptr as *mut u8
     }
 
     pub unsafe fn dealloc(ptr: *mut u8, len: usize) {
-        let result = munmap(ptr as *mut c_void, len);
-        if result != 0 {
-            panic!("munmap failed: {}", std::io::Error::last_os_error());
-        }
+        munmap(ptr.cast(), len)
+            .unwrap_or_else(|err| panic!("munmap failed: {}", std::io::Error::from(err)));
     }
 }
 

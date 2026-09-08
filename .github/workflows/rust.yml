@@ -138,6 +138,66 @@ jobs:
           path: coverage/
           retention-days: 14
 
+  build-cranelift:
+    timeout-minutes: 90
+    strategy:
+      matrix:
+        include:
+          - os: blacksmith-4vcpu-ubuntu-2404
+            target: x86_64-unknown-linux-gnu
+          - os: blacksmith-8vcpu-windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustc-codegen-cranelift
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-cranelift"
+          cache-on-failure: true
+      - name: Install LLVM (libclang for bindgen)
+        if: runner.os == 'Windows'
+        run: |
+          choco install llvm -y --no-progress
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+      - name: Build with Cranelift backend
+        run: bash scripts/build-cranelift.sh --target ${{ matrix.target }} -p turso_core -p turso_cli
+        env:
+          RUSTFLAGS: --cfg=tokio_unstable
+
+  cross-target-check:
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: blacksmith-8vcpu-windows-2025
+          - target: x86_64-pc-windows-gnu
+            os: blacksmith-8vcpu-windows-2025
+          - target: x86_64-pc-windows-gnullvm
+            os: blacksmith-8vcpu-windows-2025
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-cross-${{ matrix.target }}"
+          cache-on-failure: true
+      - name: Install LLVM (libclang for bindgen)
+        run: |
+          choco install llvm -y --no-progress
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+      - name: Check default workspace crates
+        run: cargo check --locked --target ${{ matrix.target }} -p turso_core -p turso_cli -p turso_sqlite3
+        env:
+          CC_x86_64_pc_windows_msvc: cl.exe
+
   # Runs without --all-features because the corruption and short-read tests
   # are compile-gated on the "checksum" feature being disabled: with page
   # checksums active, byte-level corruption is caught at the pager layer

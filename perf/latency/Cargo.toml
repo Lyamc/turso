@@ -19,7 +19,6 @@ path = "main.rs"
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
-libc = "0.2.172"
 rusqlite = { workspace = true }
 tokio = { workspace = true, default-features = true, features = ["full"] }
 turso = { workspace = true }

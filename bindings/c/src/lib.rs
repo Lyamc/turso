@@ -16,6 +16,24 @@ use turso_ext::Value as ExtValue;
 static EXPERIMENTAL_ENABLED: AtomicBool = AtomicBool::new(false);
 static SQLITE_VERSION_C_STRING: OnceLock<CString> = OnceLock::new();
 
+extern "C" {
+    fn malloc(size: usize) -> *mut ffi::c_void;
+    fn free(ptr: *mut ffi::c_void);
+}
+
+unsafe fn sqlite_malloc(size: usize) -> *mut ffi::c_void {
+    if size == 0 {
+        return std::ptr::null_mut();
+    }
+    unsafe { malloc(size) }
+}
+
+unsafe fn sqlite_free(ptr: *mut ffi::c_void) {
+    if !ptr.is_null() {
+        unsafe { free(ptr) };
+    }
+}
+
 /// Global B-tree search counter exposed to the TCL test harness as
 /// `sqlite_search_count`.
 #[no_mangle]
@@ -1702,7 +1720,7 @@ pub unsafe extern "C" fn turso_printf_va(
                     };
                     if slot == PrintfCArg::OwnedText {
                         // %z: the caller yields the pointer.
-                        libc::free(s as *mut ffi::c_void);
+                        sqlite_free(s as *mut ffi::c_void);
                     }
                     value
                 }
@@ -1734,7 +1752,7 @@ pub unsafe extern "C" fn turso_printf_va(
     let n = rendered.len();
     // SAFETY: fresh allocation of n + 1 bytes, copied then NUL-terminated.
     unsafe {
-        let buf = libc::malloc(n + 1) as *mut ffi::c_char;
+        let buf = sqlite_malloc(n + 1) as *mut ffi::c_char;
         if buf.is_null() {
             return std::ptr::null_mut();
         }
@@ -1831,7 +1849,7 @@ pub unsafe extern "C" fn sqlite3_malloc64(n: ffi::c_int) -> *mut ffi::c_void {
     if n <= 0 {
         return std::ptr::null_mut();
     }
-    libc::malloc(n as usize)
+    sqlite_malloc(n as usize)
 }
 
 #[no_mangle]
@@ -1839,7 +1857,7 @@ pub unsafe extern "C" fn sqlite3_free(ptr: *mut ffi::c_void) {
     if ptr.is_null() {
         return;
     }
-    libc::free(ptr);
+    sqlite_free(ptr);
 }
 
 /// Returns the error code for the most recent failed API call to connection.
@@ -1955,7 +1973,7 @@ pub unsafe extern "C" fn sqlite3_expanded_sql(stmt: *mut sqlite3_stmt) -> *mut f
     let stmt: &sqlite3_stmt = unsafe { &*stmt };
     let expanded = stmt.stmt.expanded_sql();
     let n = expanded.len();
-    let buf = unsafe { libc::malloc(n + 1) } as *mut ffi::c_char;
+    let buf = unsafe { sqlite_malloc(n + 1) } as *mut ffi::c_char;
     if buf.is_null() {
         return std::ptr::null_mut();
     }
@@ -2713,7 +2731,7 @@ pub unsafe extern "C" fn sqlite3_get_table(
 
     // Allocate a raw C array with an extra slot at position 0 for the entry count,
     // following the SQLite convention. sqlite3_free_table will step back to read it.
-    let array = libc::malloc(std::mem::size_of::<*mut ffi::c_char>() * (n_data + 1))
+    let array = sqlite_malloc(std::mem::size_of::<*mut ffi::c_char>() * (n_data + 1))
         as *mut *mut ffi::c_char;
     if array.is_null() {
         res.free();
@@ -2753,7 +2771,7 @@ pub unsafe extern "C" fn sqlite3_free_table(az_result: *mut *mut ffi::c_char) {
             sqlite3_free(ptr as *mut _);
         }
     }
-    libc::free(array as *mut _);
+    sqlite_free(array as *mut _);
 }
 
 // sqlite3_result_* functions set the return value of a custom SQL function.
