@@ -932,6 +932,7 @@ pub enum Insn {
         /// count toward SQLITE_STMTSTATUS_FULLSCAN_STEP, matching SQLite,
         /// which tags the opcode with P5 at codegen time.
         fullscan: bool,
+        is_index: bool,
     },
 
     Prev {
@@ -939,6 +940,8 @@ pub enum Insn {
         pc_if_prev: BranchOffset,
         /// See [Insn::Next::fullscan].
         fullscan: bool,
+        /// See [Insn::Next::is_index].
+        is_index: bool,
     },
 
     /// Halt the program.
@@ -2127,28 +2130,6 @@ const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
 
 const INSN_VTABLE: [InsnFunction; InsnVariants::COUNT] = get_insn_virtual_table();
 
-/// Dispatches one instruction.
-///
-/// The opcodes that are most likely to run in a loop are matched directly so LLVM can inline them
-/// into the dispatch loop.
-#[inline(always)]
-pub(crate) fn dispatch_insn(
-    program: &super::Program,
-    state: &mut super::ProgramState,
-    insn: &Insn,
-    pager: &std::sync::Arc<crate::Pager>,
-) -> execute::InsnResult {
-    match insn {
-        Insn::Next { .. } => execute::op_next(program, state, insn, pager),
-        Insn::ResultRow { .. } => execute::op_result_row(program, state, insn, pager),
-        Insn::Column { .. } => execute::op_column(program, state, insn, pager),
-        Insn::ColumnRange { .. } => execute::op_column_range(program, state, insn, pager),
-        Insn::RowId { .. } => execute::op_row_id(program, state, insn, pager),
-        Insn::Prev { .. } => execute::op_prev(program, state, insn, pager),
-        _ => insn.to_function()(program, state, insn, pager),
-    }
-}
-
 impl InsnVariants {
     // This function is used for testing
     #[allow(dead_code)]
@@ -2180,12 +2161,12 @@ impl InsnVariants {
             InsnVariants::Move => execute::op_move,
             InsnVariants::IfPos => execute::op_if_pos,
             InsnVariants::NotNull => execute::op_not_null,
-            InsnVariants::Eq
-            | InsnVariants::Ne
-            | InsnVariants::Lt
-            | InsnVariants::Le
-            | InsnVariants::Gt
-            | InsnVariants::Ge => execute::op_comparison,
+            InsnVariants::Eq => execute::op_eq,
+            InsnVariants::Ne => execute::op_ne,
+            InsnVariants::Lt => execute::op_lt,
+            InsnVariants::Le => execute::op_le,
+            InsnVariants::Gt => execute::op_gt,
+            InsnVariants::Ge => execute::op_ge,
             InsnVariants::If => execute::op_if,
             InsnVariants::IfNot => execute::op_if_not,
             InsnVariants::OpenRead => execute::op_open_read,
