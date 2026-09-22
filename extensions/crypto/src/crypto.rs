@@ -1,7 +1,8 @@
 use crate::Error;
 use blake3::Hasher;
 use data_encoding::{BASE32, BASE64, HEXLOWER};
-use ring::digest::{self, digest};
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::{borrow::Cow, error::Error as StdError};
 use turso_ext::{Value, ValueType};
 
@@ -9,8 +10,7 @@ pub fn sha256(data: &Value) -> Result<Vec<u8>, Error> {
     match data.value_type() {
         ValueType::Error | ValueType::Null => Err(Error::InvalidType),
         _ => {
-            let hash = digest(&digest::SHA256, &data.as_bytes());
-            Ok(hash.as_ref().to_vec())
+            Ok(Sha256::digest(data.as_bytes()).to_vec())
         }
     }
 }
@@ -19,8 +19,7 @@ pub fn sha512(data: &Value) -> Result<Vec<u8>, Error> {
     match data.value_type() {
         ValueType::Error | ValueType::Null => Err(Error::InvalidType),
         _ => {
-            let hash = digest(&digest::SHA512, &data.as_bytes());
-            Ok(hash.as_ref().to_vec())
+            Ok(Sha512::digest(data.as_bytes()).to_vec())
         }
     }
 }
@@ -29,8 +28,7 @@ pub fn sha384(data: &Value) -> Result<Vec<u8>, Error> {
     match data.value_type() {
         ValueType::Error | ValueType::Null => Err(Error::InvalidType),
         _ => {
-            let hash = digest(&digest::SHA384, &data.as_bytes());
-            Ok(hash.as_ref().to_vec())
+            Ok(Sha384::digest(data.as_bytes()).to_vec())
         }
     }
 }
@@ -50,8 +48,7 @@ pub fn sha1(data: &Value) -> Result<Vec<u8>, Error> {
     match data.value_type() {
         ValueType::Error | ValueType::Null => Err(Error::InvalidType),
         _ => {
-            let hash = digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &data.as_bytes());
-            Ok(hash.as_ref().to_vec())
+            Ok(Sha1::digest(data.as_bytes()).to_vec())
         }
     }
 }

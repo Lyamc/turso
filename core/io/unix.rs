@@ -66,7 +66,9 @@ extern "C" {
 fn fcntl_flock(fd: RawFd, cmd: i32, lock: &mut RawFlock) -> io::Result<()> {
     let rc = unsafe { fcntl(fd, cmd, lock) };
     if rc == -1 {
-        Err(io::Errno::last_os_error())
+        Err(io::Errno::from_raw_os_error(
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        ))
     } else {
         Ok(())
     }
@@ -268,12 +270,7 @@ pub(crate) fn unix_shared_wal_map(
             "cannot mmap shared WAL coordination region with zero length".into(),
         ));
     }
-    let page_size = param::page_size().map_err(|err| {
-        LimboError::LockingError(format!(
-            "failed to determine shared WAL mmap page size: {}",
-            std::io::Error::from(err)
-        ))
-    })? as u64;
+    let page_size = param::page_size() as u64;
     let aligned_offset = offset / page_size * page_size;
     let prefix_len = (offset - aligned_offset) as usize;
     let mapping_len = prefix_len

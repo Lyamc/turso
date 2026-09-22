@@ -4,6 +4,14 @@ use std::process::Command;
 use std::{env, fs};
 
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(portable_simd)");
+    let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    if let Ok(output) = Command::new(rustc).arg("--version").output() {
+        if String::from_utf8_lossy(&output.stdout).contains("nightly") {
+            println!("cargo::rustc-cfg=portable_simd");
+        }
+    }
+
     cfg_aliases! {
         injected_yields: { any(feature = "test_helper", feature = "simulator") },
         host_shared_wal: { all(any(unix, target_os = "windows"), target_pointer_width = "64") },

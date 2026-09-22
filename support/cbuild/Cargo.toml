@@ -1,0 +1,9 @@
+[package]
+name = "cbuild"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Small C/assembly build helper used instead of the cc crate"
+
+[lib]
+path = "src/lib.rs"

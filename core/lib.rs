@@ -10,6 +10,7 @@
         vec_push_within_capacity
     )
 )]
+#![cfg_attr(portable_simd, feature(portable_simd))]
 #![recursion_limit = "256"]
 
 pub mod alloc;

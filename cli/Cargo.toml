@@ -37,7 +37,7 @@ turso_core = { workspace = true, default-features = true, features = [
 turso_parser = { workspace = true }
 turso_sync_engine = { workspace = true }
 limbo_completion = { workspace = true, features = ["static"] }
-miette = { workspace = true, features = ["fancy"] }
+miette = { workspace = true, features = ["fancy-no-backtrace"] }
 nu-ansi-term = { version = "0.50.1", features = [
     "serde",
     "derive_serde_style",

@@ -222,7 +222,7 @@ codegen-units = 16        # Less cross-unit inlining
 inherits = "release-official"
 
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'cfg(antithesis)', 'cfg(nightly)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'cfg(antithesis)', 'cfg(nightly)', 'cfg(portable_simd)'] }
 # For now allow this for the allocator api migration
 unstable_name_collisions = "allow"
 
@@ -237,3 +237,23 @@ large_stack_frames = "deny"
 large_types_passed_by_value = "deny"
 redundant_clone = "deny"
 assigning_clones = "deny"
+
+[patch.crates-io]
+aegis = { path = "third_party/aegis" }
+blake3 = { path = "third_party/blake3" }
+codspeed = { path = "third_party/codspeed" }
+console = { path = "third_party/console" }
+findshlibs = { path = "third_party/findshlibs" }
+generator = { path = "third_party/generator" }
+hyper-util = { path = "third_party/hyper-util" }
+notify = { path = "third_party/notify" }
+iana-time-zone-haiku = { path = "third_party/iana-time-zone-haiku" }
+libmimalloc-sys = { path = "third_party/libmimalloc-sys" }
+libsqlite3-sys = { path = "third_party/libsqlite3-sys" }
+pg_query = { path = "third_party/pg_query" }
+psm = { path = "third_party/psm" }
+pyo3 = { path = "third_party/pyo3" }
+pyo3-ffi = { path = "third_party/pyo3-ffi" }
+rustyline = { path = "third_party/rustyline" }
+stacker = { path = "third_party/stacker" }
+zstd-sys = { path = "third_party/zstd-sys" }

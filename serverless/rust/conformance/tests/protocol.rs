@@ -8,7 +8,12 @@
 use serde_json::{json, Value};
 use turso_serverless_conformance::{config_or_skip, unique_name, TestConfig};
 
+fn install_tls_provider() {
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+}
+
 async fn post(config: &TestConfig, path: &str, body: &Value) -> (u16, String) {
+    install_tls_provider();
     let response = reqwest::Client::new()
         .post(format!("{}{path}", config.url))
         .header("Authorization", format!("Bearer {}", config.auth_token))
@@ -756,6 +761,7 @@ async fn want_rows_false_omits_rows() {
 /// Send a `SELECT 1` pipeline with the given `Authorization` bearer token
 /// (or no header at all) and return the response status.
 async fn auth_status(config: &TestConfig, token: Option<&str>) -> u16 {
+    install_tls_provider();
     let mut request = reqwest::Client::new()
         .post(format!("{}/v3/pipeline", config.url))
         .header("Content-Type", "application/json");

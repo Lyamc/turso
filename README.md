@@ -425,7 +425,7 @@ EOF
 
 ## Building from source
 
-Turso uses [Rust](https://rustup.rs/) 1.88 (see `rust-toolchain.toml`). A normal build uses the default LLVM backend:
+This fork builds with nightly Rust (see `rust-toolchain.toml`) so vector math can use `std::simd`. A normal build uses the default LLVM backend:
 
 ```shell
 cargo build
@@ -462,7 +462,50 @@ Cross-check a specific target:
 cargo check --target x86_64-pc-windows-gnullvm -p turso_core
 ```
 
-The C API binding compiles a small C helper (`varargs.c`) via the platform C compiler during the build. No `libc` or `cc` crate is required at build time.
+The C API binding compiles a small C helper (`varargs.c`) via the platform C compiler during the build. The workspace does not depend on the `cc` or `cmake` crates. C libraries that Turso still ships (SQLite, zstd, mimalloc, libpg_query, and a few smaller ones) are compiled by `support/cbuild` instead. A default Windows build still compiles the `libc` crate for `bindgen`'s `clang-sys`. The Python bindings use a patched PyO3 that declares the C types it needs directly. Unix targets also use `libc` for terminals, file notification, and sockets. AEGIS and BLAKE3 use their Rust implementations, HTTPS uses `rustls-rustcrypto`, the Postgres wire server uses `pgwire` without its aws-lc or ring backends, and the `simd` feature lowers vector distances through nightly `std::simd`.
+
+## Compared with upstream
+
+Upstream is `main` at `46af12d5b`, built with its pinned Rust 1.88. This fork was built with nightly `1.100.0` from 2026-09-08. Both builds are `x86_64-pc-windows-gnu` on a 13th Gen Core i9-13900K (24 cores, 32 threads).
+
+| | Upstream | This fork |
+| --- | ---: | ---: |
+| Source checkout | 72.9 MiB, 717,363 lines | 125.8 MiB, 2,098,924 lines |
+| First-party source | 72.9 MiB, 717,363 lines | 73.0 MiB, 718,300 lines |
+| Release compile | 2 min 28 s | 2 min 34 s |
+| `tursodb.exe` | 112.5 MiB | 113.5 MiB |
+| Peak memory | 28.5 MiB | 22.3 MiB |
+| Processor time | 0.41 s | 0.41 s |
+| Workload wall time | 473 ms | 482 ms |
+
+Source size and lines are the checkout with `.git` and `target/` left out, counting Rust, C, and C++. The checkout is larger here because `third_party/` vendors SQLite, zstd, mimalloc, libpg_query, and the patched crates (52.8 MiB, 1,380,624 lines). Upstream compiles those same libraries from crates.io and does not keep them in the git tree. First-party source is the checkout with `third_party/` removed.
+
+The release compile is a cold `cargo build --release -p turso_cli --bin tursodb` into an empty target directory. Both trees use the same release profile: thin LTO, 4 codegen units, line-number debug info. That line info is why `tursodb.exe` is about 113 MiB.
+
+Peak memory, processor time, and wall time are the median of 5 runs of that release binary. The script creates a 40,000-row table inside one transaction, checks `COUNT(*)` is 40,000, then runs `SELECT SUM(value) FROM t` 400 times. Both binaries returned the same count. Processor time is about one core for the whole run; the gap sits inside the 16 ms timer tick. Peak memory is the process peak working set and is 22% lower here (22.3 MiB versus 28.5 MiB).
+
+Platform support matches the CI matrix already in this tree: Linux and macOS, Windows MSVC, Windows GNU, Windows gnullvm, a Windows ARM64 CLI build, and a `wasm32-unknown-unknown` check of the Rust binding. Cranelift builds are Linux and Windows MSVC. The numbers above were measured on Windows GNU. Vector distances use `std::simd` when the compiler is nightly; a stable compiler still builds the scalar path. The workspace does not use the `cc` or `cmake` crates. Building still needs a system C compiler for SQLite, zstd, mimalloc, libpg_query, and the small C helper in the C binding. The Postgres parser's `bindgen` step still needs `libclang`.
+
+### In-process query times
+
+Same machine, both sides on nightly `1.100.0`, `bench-profile` (opt-level 3, no LTO, 16 codegen units). Each number is the median of 5 runs after one warmup, from `core/benches/fork_compare.rs`:
+
+```shell
+cargo bench -p turso_core --bench fork_compare --profile bench-profile
+```
+
+| Workload | This fork | Upstream | Fork vs upstream |
+| --- | ---: | ---: | ---: |
+| `SELECT 1` over 20,000 rows | 0.172 ms | 0.152 ms | 13% slower (0.02 ms) |
+| `SELECT *` over 20,000 rows | 0.483 ms | 0.485 ms | 0.4% faster |
+| 4,000 primary-key lookups | 2.639 ms | 2.651 ms | 0.5% faster |
+| 5,000-row insert transaction | 5.932 ms | 5.984 ms | 0.9% faster |
+| 2,000 × 256-d `vector_distance_l2` | 17.561 ms | 18.774 ms | 6.5% faster |
+| 2,000 × 256-d `vector_distance_cos` | 17.537 ms | 18.798 ms | 6.7% faster |
+
+Query and insert times match upstream. The `SELECT 1` gap is a few tens of microseconds on a scan that short. Vector calls are faster with `std::simd` than with upstream's SimSIMD path.
+
+The same inputs do not produce bit-identical distances, because the lane reduction order differs. On this pair of 256-d vectors, L2 was 7.93750 here and 7.93860 upstream (about 0.014% apart). Cosine was 0.32690 here and 0.32777 upstream (about 0.27% apart).
 
 ## Contributing
 

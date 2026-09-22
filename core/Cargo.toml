@@ -61,7 +61,7 @@ codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
 stacker = ["dep:stacker"]
 percentile = []
-simd = ["dep:simsimd"]
+simd = []
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true, features = [
@@ -147,9 +147,6 @@ bigdecimal = "0.4"
 num-bigint = "0.4"
 num-traits = "0.2"
 stacker = { version = "0.1", optional = true }
-
-[target.'cfg(not(any(target_family = "wasm", all(target_os = "windows", target_arch = "aarch64"))))'.dependencies]
-simsimd = { version = "6.5.3", optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 # From fastbloom/rand
@@ -315,4 +312,8 @@ harness = false
 
 [[bench]]
 name = "string_expr_benchmark"
+harness = false
+
+[[bench]]
+name = "fork_compare"
 harness = false

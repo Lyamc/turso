@@ -741,7 +741,7 @@ impl IoWorker {
         let mut http_connector = HttpConnector::new();
         http_connector.enforce_http(false);
         let https: HttpsConnector<HttpConnector> = HttpsConnector::<HttpConnector>::builder()
-            .with_native_roots()
+            .with_provider_and_native_roots(Arc::new(rustls_rustcrypto::provider()))
             .expect("failed to load native root CA certificates")
             .https_or_http()
             .enable_http1()

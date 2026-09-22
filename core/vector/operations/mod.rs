@@ -1,3 +1,6 @@
+#[cfg(all(feature = "simd", portable_simd))]
+mod portable_simd;
+
 pub mod concat;
 pub mod convert;
 pub mod distance_cos;

@@ -34,6 +34,10 @@ pub fn normalize_url(url: &str) -> String {
     url.trim_end_matches('/').to_string()
 }
 
+fn install_tls_provider() {
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+}
+
 /// Connection state observable without a server round trip. Shared between
 /// the session (which updates it) and the connection handle (which reads it
 /// from synchronous accessors like `is_autocommit`).
@@ -141,6 +145,7 @@ impl Session {
             autocommit: AtomicBool::new(true),
             last_insert_rowid: AtomicI64::new(0),
         });
+        install_tls_provider();
         let session = Self {
             client: reqwest::Client::new(),
             auth_token,
