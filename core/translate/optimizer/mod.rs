@@ -58,10 +58,10 @@ use constraints::{
     add_implied_column_equalities, can_use_partial_index, constraints_from_where_clause,
     partial_index, partial_index_predicate_terms, Constraint,
 };
-use cost::Cost;
+use cost::{estimate_scan_cost, estimate_sort_cpu_cost, Cost};
 use join::{
     compute_best_join_order_with_context, count_subquery_calls_for_plan, BestJoinOrderResult,
-    JoinN, JoinPlanningContext,
+    CorrelatedSubqueryEstimate, JoinN, JoinPlanningContext,
 };
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{
@@ -374,6 +374,7 @@ fn try_match_index_method_pattern(
             let captured = try_capture_parameters(pattern_off, query_off)?;
             parameters.extend(captured);
         }
+        (None, Some(_)) if pattern_has_limit => return None,
         (None, Some(_)) | (None, None) => {}
     }
 
@@ -823,13 +824,17 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
         return None;
     }
 
+    let is_unfiltered_btree_count = matches!(table_ref.table, Table::BTree(..))
+        && plan.table_references.outer_query_refs().is_empty()
+        && plan.where_clause.is_empty()
+        && plan.offset.is_none();
+
     match agg.func {
-        AggFunc::Count0
-            if matches!(table_ref.table, Table::BTree(..))
-                && plan.table_references.outer_query_refs().is_empty()
-                && plan.where_clause.is_empty()
-                && plan.limit.is_none()
-                && plan.offset.is_none() =>
+        AggFunc::Count0 if is_unfiltered_btree_count => Some(SimpleAggregate::Count),
+        AggFunc::Count
+            if is_unfiltered_btree_count
+                && matches!(agg.distinctness, super::plan::Distinctness::NonDistinct)
+                && agg.args[0].is_nonnull(&plan.table_references) =>
         {
             Some(SimpleAggregate::Count)
         }
@@ -868,7 +873,7 @@ struct TableAccessPlan {
     access_methods: Vec<AccessMethod>,
     constraints: Vec<TableConstraints>,
     join: JoinN,
-    subquery_calls: SmallVec<[(TableInternalId, f64); 2]>,
+    subquery_calls: SmallVec<[CorrelatedSubqueryEstimate; 2]>,
     order_target: Option<OrderTarget>,
     sort_eliminated: bool,
     initial_input_rows: f64,
@@ -985,6 +990,12 @@ fn optimize_select_plan_with_cache(
             (plan.estimated_cost, rewritten.estimated_cost),
             (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
         );
+    tracing::debug!(
+        original_cost = plan.estimated_cost,
+        rewritten_cost = rewritten.estimated_cost,
+        use_rewritten,
+        "correlated-subquery form cost comparison"
+    );
     if use_rewritten {
         // Equal work is better without one subquery call per outer row.
         *plan = rewritten;
@@ -1085,7 +1096,9 @@ fn find_select_plan_form(
         plan.simple_aggregate = None;
     }
 
-    let table_cost = table_plan.as_ref().map(|table_plan| table_plan.join.cost);
+    let table_cost = table_plan.as_ref().map(|table_plan| {
+        table_plan.join.cost + required_group_sort_and_read_cost(plan, table_plan, params)
+    });
     let mut subquery_calls = table_plan
         .as_ref()
         .map(|table_plan| table_plan.subquery_calls.clone())
@@ -1119,8 +1132,8 @@ fn find_select_plan_form(
                         // These call counts cover the full result. LIMIT only
                         // needs the same share of those calls.
                         let call_scale = (rows / rows_before_limit).min(1.0);
-                        for (_, calls) in &mut subquery_calls {
-                            *calls *= call_scale;
+                        for estimate in &mut subquery_calls {
+                            estimate.calls *= call_scale;
                         }
                     }
                 }
@@ -1151,7 +1164,8 @@ fn find_select_plan_form(
                     let calls = if subquery.correlated {
                         subquery_calls
                             .iter()
-                            .find_map(|(id, calls)| (*id == subquery.internal_id).then_some(*calls))
+                            .find(|estimate| estimate.subquery_id == subquery.internal_id)
+                            .map(|estimate| estimate.calls)
                             .unwrap_or_else(|| plan.input_cardinality_hint.unwrap_or(1.0))
                     } else {
                         1.0
@@ -1168,6 +1182,27 @@ fn find_select_plan_form(
     }
 
     Ok(table_plan)
+}
+
+fn required_group_sort_and_read_cost(
+    plan: &SelectPlan,
+    table_plan: &TableAccessPlan,
+    params: &cost_params::CostModelParams,
+) -> Cost {
+    let group_sort_eliminated = table_plan.sort_eliminated
+        && table_plan.order_target.as_ref().is_some_and(|target| {
+            matches!(
+                &target.purpose,
+                OrderTargetPurpose::EliminatesSort(
+                    EliminatesSortBy::Group | EliminatesSortBy::GroupByAndOrder
+                )
+            )
+        });
+    if plan.group_by.as_ref().is_none_or(|group| group.sort_elided) || group_sort_eliminated {
+        return Cost(0.0);
+    }
+    let rows = table_plan.join.output_cardinality;
+    estimate_sort_cpu_cost(rows, params) + estimate_scan_cost(rows, 1.0, params)
 }
 
 /// Write the winning table plan into one version of a query.
@@ -1734,7 +1769,7 @@ fn optimize_subqueries(
 fn plan_correlated_subqueries(
     plan: &mut SelectPlan,
     resolver: &Resolver,
-    subquery_calls: &[(TableInternalId, f64)],
+    subquery_calls: &[CorrelatedSubqueryEstimate],
     cache: &mut SubqueryPlanCache,
     save_plans: bool,
 ) -> Result<()> {
@@ -1745,9 +1780,13 @@ fn plan_correlated_subqueries(
         if !subquery.correlated || subquery.origin.is_write_statement() {
             continue;
         }
-        let call_count = subquery_calls
+        let estimate = subquery_calls
             .iter()
-            .find_map(|(id, calls)| (*id == subquery.internal_id).then_some(*calls))
+            .find(|estimate| estimate.subquery_id == subquery.internal_id);
+        subquery.preferred_eval_after_table =
+            estimate.and_then(|estimate| estimate.eval_after_table);
+        let call_count = estimate
+            .map(|estimate| estimate.calls)
             .unwrap_or_else(|| plan.input_cardinality_hint.unwrap_or(1.0))
             .max(1.0);
         let SubqueryState::Unevaluated {
@@ -3094,6 +3133,11 @@ fn apply_table_access_plan(
             hash_build_by_probe[member.original_idx] = Some(hash_join_op.build_table_idx);
         }
     }
+    let selected_build_searches: Vec<bool> = table_references
+        .joined_tables()
+        .iter()
+        .map(|table| matches!(table.op, Operation::Search(_)))
+        .collect();
 
     // If hash-join build constraints are still evaluated later (not consumed),
     // avoid materializing the build input to reduce redundant scans.
@@ -3146,7 +3190,7 @@ fn apply_table_access_plan(
             has_prior_constraints = true;
             break;
         }
-        if !has_prior_constraints {
+        if !has_prior_constraints && !selected_build_searches[hash_join_op.build_table_idx] {
             hash_join_op.materialize_build_input = false;
         }
     }
@@ -3404,6 +3448,8 @@ impl Optimizable for ast::Expr {
                 lhs, start, end, ..
             } => lhs.is_nonnull(tables) && start.is_nonnull(tables) && end.is_nonnull(tables),
             Expr::Binary(_, ast::Operator::Modulus | ast::Operator::Divide, _) => false, // 1 % 0, 1 / 0
+            Expr::Binary(_, ast::Operator::ArrowRight | ast::Operator::ArrowRightShift, _) => false, // JSON path may be absent, yielding NULL
+            Expr::Binary(_, ast::Operator::ArrayContains | ast::Operator::ArrayOverlap, _) => false,
             Expr::Binary(expr, _, expr1) => expr.is_nonnull(tables) && expr1.is_nonnull(tables),
             Expr::Case {
                 when_then_pairs,
@@ -3458,7 +3504,19 @@ impl Optimizable for ast::Expr {
             Expr::InSelect { .. } => false,
             Expr::InTable { .. } => false,
             Expr::IsNull(..) => true,
-            Expr::Like { lhs, rhs, .. } => lhs.is_nonnull(tables) && rhs.is_nonnull(tables),
+            Expr::Like {
+                op: ast::LikeOperator::Regexp,
+                ..
+            } => false,
+            Expr::Like {
+                lhs, rhs, escape, ..
+            } => {
+                lhs.is_nonnull(tables)
+                    && rhs.is_nonnull(tables)
+                    && escape
+                        .as_ref()
+                        .is_none_or(|escape| escape.is_nonnull(tables))
+            }
             Expr::Literal(literal) => match literal {
                 ast::Literal::Numeric(_) => true,
                 ast::Literal::String(_) => true,

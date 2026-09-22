@@ -866,9 +866,13 @@ pub fn read_btree_cell(
             let (payload_size, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(page, pos..))?;
             pos += nr;
 
-            let (overflows, to_read) =
-                payload_overflows(payload_size as usize, max_local, min_local, usable_size);
-            let to_read = if overflows { to_read } else { page.len() - pos };
+            let to_read = if let Some(local_size) =
+                payload_overflows(payload_size as usize, max_local, min_local, usable_size)
+            {
+                local_size
+            } else {
+                page.len() - pos
+            };
 
             crate::assert_or_bail_corrupt!(
                 pos + to_read <= page.len(),
@@ -908,9 +912,13 @@ pub fn read_btree_cell(
             let (payload_size, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(page, pos..))?;
             pos += nr;
 
-            let (overflows, to_read) =
-                payload_overflows(payload_size as usize, max_local, min_local, usable_size);
-            let to_read = if overflows { to_read } else { page.len() - pos };
+            let to_read = if let Some(local_size) =
+                payload_overflows(payload_size as usize, max_local, min_local, usable_size)
+            {
+                local_size
+            } else {
+                page.len() - pos
+            };
 
             crate::assert_or_bail_corrupt!(
                 pos + to_read <= page.len(),
@@ -934,9 +942,13 @@ pub fn read_btree_cell(
             let (rowid, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(page, pos..))?;
             pos += nr;
 
-            let (overflows, to_read) =
-                payload_overflows(payload_size as usize, max_local, min_local, usable_size);
-            let to_read = if overflows { to_read } else { page.len() - pos };
+            let to_read = if let Some(local_size) =
+                payload_overflows(payload_size as usize, max_local, min_local, usable_size)
+            {
+                local_size
+            } else {
+                page.len() - pos
+            };
 
             crate::assert_or_bail_corrupt!(
                 pos + to_read <= page.len(),
@@ -1117,10 +1129,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     content_size
                 ))
             })?;
-            let val = crate::types::validate_utf8(data).ok_or_else(|| {
-                mark_unlikely();
-                LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
-            })?;
+            let val = read_text(data)?;
             Ok((
                 ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
                 content_size,
@@ -1247,10 +1256,7 @@ pub fn read_value_serial_type<'a>(
                         content_size
                     ))
                 })?;
-                let val = crate::types::validate_utf8(data).ok_or_else(|| {
-                    mark_unlikely();
-                    LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
-                })?;
+                let val = read_text(data)?;
                 Ok((
                     ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
                     content_size,
@@ -1263,6 +1269,14 @@ pub fn read_value_serial_type<'a>(
             crate::bail_corrupt_error!("Invalid serial type for integer")
         }
     }
+}
+
+#[inline(always)]
+pub fn read_text(payload: &[u8]) -> Result<&str> {
+    crate::types::validate_utf8(payload).ok_or_else(|| {
+        mark_unlikely();
+        LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
+    })
 }
 
 #[inline(always)]
@@ -2202,27 +2216,27 @@ pub fn begin_write_wal_header<F: File + ?Sized>(
     Ok(c)
 }
 
-/// Checks if payload will overflow a cell based on the maximum allowed size.
-/// It will return the min size that will be stored in that case,
-/// including overflow pointer
-/// see e.g. https://github.com/sqlite/sqlite/blob/9591d3fe93936533c8c3b0dc4d025ac999539e11/src/dbstat.c#L371
+/// If the payload overflows the given limits, returns `Some(local_size)`, where `local_size` is
+/// the size that shall be occupied on the page by the payload plus its overflow page pointer.
+///
+/// Otherwise, returns `None`.
 #[inline]
 pub fn payload_overflows(
     payload_size: usize,
-    payload_overflow_threshold_max: usize,
-    payload_overflow_threshold_min: usize,
+    max_local_bytes: usize,
+    min_local_bytes: usize,
     usable_size: usize,
-) -> (bool, usize) {
-    if payload_size <= payload_overflow_threshold_max {
-        return (false, 0);
+) -> Option<usize> {
+    // See https://github.com/sqlite/sqlite/blob/9591d3fe93936533c8c3b0dc4d025ac999539e11/src/dbstat.c#L371
+    if payload_size <= max_local_bytes {
+        return None;
     }
 
-    let mut space_left = payload_overflow_threshold_min
-        + (payload_size - payload_overflow_threshold_min) % (usable_size - 4);
-    if space_left > payload_overflow_threshold_max {
-        space_left = payload_overflow_threshold_min;
+    let mut space_left = min_local_bytes + (payload_size - min_local_bytes) % (usable_size - 4);
+    if space_left > max_local_bytes {
+        space_left = min_local_bytes;
     }
-    (true, space_left + 4)
+    Some(space_left + 4)
 }
 
 /// The checksum is computed by interpreting the input as an even number of unsigned 32-bit integers: x(0) through x(N).
@@ -2287,7 +2301,44 @@ mod tests {
     use crate::Value;
 
     use super::*;
+    use asserting::prelude::*;
     use rstest::rstest;
+
+    #[rstest]
+    #[case(PageType::TableLeaf, 4096, 0, None)]
+    #[case(PageType::TableLeaf, 4096, 4061, None)]
+    #[case(PageType::TableLeaf, 4096, 4062, Some(493))]
+    #[case(PageType::TableLeaf, 4096, 4500, Some(493))]
+    #[case(PageType::TableLeaf, 4096, 4581, Some(493))]
+    #[case(PageType::TableLeaf, 4096, 5000, Some(912))]
+    #[case(PageType::TableLeaf, 4096, 8153, Some(4065))]
+    #[case(PageType::TableLeaf, 4096, 8154, Some(493))]
+    #[case(PageType::IndexLeaf, 4096, 1002, None)]
+    #[case(PageType::IndexLeaf, 4096, 1003, Some(493))]
+    #[case(PageType::IndexLeaf, 4096, 4581, Some(493))]
+    #[case(PageType::IndexLeaf, 4096, 5094, Some(1006))]
+    #[case(PageType::IndexLeaf, 4096, 5095, Some(493))]
+    #[case(PageType::IndexInterior, 4096, 5000, Some(912))]
+    #[case(PageType::TableLeaf, 512, 477, None)]
+    #[case(PageType::TableLeaf, 512, 478, Some(43))]
+    #[case(PageType::IndexLeaf, 512, 102, None)]
+    #[case(PageType::IndexLeaf, 512, 103, Some(43))]
+    #[case(PageType::TableLeaf, 65536, 65501, None)]
+    #[case(PageType::TableLeaf, 65536, 65502, Some(8203))]
+    fn test_payload_overflows(
+        #[case] page_type: PageType,
+        #[case] usable_size: usize,
+        #[case] payload_size: usize,
+        #[case] expected: Option<usize>,
+    ) {
+        let result = payload_overflows(
+            payload_size,
+            payload_overflow_threshold_max(page_type, usable_size),
+            payload_overflow_threshold_min(page_type, usable_size),
+            usable_size,
+        );
+        assert_eq!(result, expected);
+    }
 
     #[rstest]
     #[case(&[], SerialType::null(), Value::Null)]
@@ -2296,9 +2347,12 @@ mod tests {
     #[case(&[0xFE], SerialType::i8(), Value::from_i64(-2))]
     #[case(&[0x12, 0x34, 0x56], SerialType::i24(), Value::from_i64(0x123456))]
     #[case(&[0x12, 0x34, 0x56, 0x78], SerialType::i32(), Value::from_i64(0x12345678))]
-    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC], SerialType::i48(), Value::from_i64(0x123456789ABC))]
-    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xFF], SerialType::i64(), Value::from_i64(0x123456789ABCDEFF))]
-    #[case(&[0x40, 0x09, 0x21, 0xFB, 0x54, 0x44, 0x2D, 0x18], SerialType::f64(), Value::from_f64(std::f64::consts::PI))]
+    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC], SerialType::i48(), Value::from_i64(0x123456789ABC)
+    )]
+    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xFF], SerialType::i64(), Value::from_i64(0x123456789ABCDEFF)
+    )]
+    #[case(&[0x40, 0x09, 0x21, 0xFB, 0x54, 0x44, 0x2D, 0x18], SerialType::f64(), Value::from_f64(std::f64::consts::PI)
+    )]
     #[case(&[1, 2], SerialType::const_int0(), Value::from_i64(0))]
     #[case(&[65, 66], SerialType::const_int1(), Value::from_i64(1))]
     #[case(
@@ -2322,8 +2376,10 @@ mod tests {
     #[case(&[0x7f, 0xff], SerialType::i16(), Value::from_i64(32767))]
     #[case(&[0x7f, 0xff, 0xff], SerialType::i24(), Value::from_i64(8388607))]
     #[case(&[0x7f, 0xff, 0xff, 0xff], SerialType::i32(), Value::from_i64(2147483647))]
-    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff], SerialType::i48(), Value::from_i64(140737488355327))]
-    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], SerialType::i64(), Value::from_i64(9223372036854775807))]
+    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff], SerialType::i48(), Value::from_i64(140737488355327)
+    )]
+    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], SerialType::i64(), Value::from_i64(9223372036854775807)
+    )]
     fn test_read_value(
         #[case] buf: &[u8],
         #[case] serial_type: SerialType,
@@ -2334,6 +2390,51 @@ mod tests {
             result.0.to_owned().expect(crate::alloc::ALLOC_ERR_MSG),
             expected
         );
+    }
+
+    #[test]
+    fn read_text_agrees_with_the_standard_library() {
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        for len in 0..=528usize {
+            payloads.push(vec![b'a'; len]);
+        }
+        for len in 1..=528usize {
+            for at in 0..len {
+                for tail in [&[0xC3u8, 0xA9][..], &[0xFF][..], &[0x80][..]] {
+                    let mut payload = vec![b'a'; len];
+                    payload.splice(at..at + 1, tail.iter().copied());
+                    payloads.push(payload);
+                }
+            }
+        }
+        for broken in [
+            &[0xE2u8, 0x82][..],
+            &[0xC0, 0xAF][..],
+            &[0xED, 0xA0, 0x80][..],
+        ] {
+            for pad in [0usize, 508, 518] {
+                let mut payload = vec![b'a'; pad];
+                payload.extend_from_slice(broken);
+                payloads.push(payload);
+            }
+        }
+
+        for payload in payloads {
+            assert_that!(crate::types::is_ascii(&payload))
+                .described_as(format!("payload {payload:?}"))
+                .is_equal_to(payload.iter().all(u8::is_ascii));
+
+            let expected = std::str::from_utf8(&payload);
+            match (read_text(&payload), expected) {
+                (Ok(got), Ok(want)) => {
+                    assert_that!(got)
+                        .described_as(format!("payload {payload:?}"))
+                        .is_equal_to(want);
+                }
+                (Err(LimboError::Corrupt(_)), Err(_)) => {}
+                (got, want) => panic!("payload {payload:?}: got {got:?}, std says {want:?}"),
+            }
+        }
     }
 
     #[test]

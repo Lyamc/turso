@@ -30,7 +30,7 @@ fn compile_kvstore() {
     } else {
         let obj = out_dir.join("kvstore.o");
         let lib = out_dir.join("libkvstore.a");
-        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+        let cc = tool("CC", &["cc", "gcc", "clang"]);
         run(Command::new(&cc)
             .args(["-c", "-o"])
             .arg(&obj)
@@ -38,12 +38,31 @@ fn compile_kvstore() {
             .arg("-I")
             .arg("include")
             .arg(src));
-        let ar = std::env::var("AR").unwrap_or_else(|_| "ar".into());
+        let ar = tool("AR", &["ar", "gcc-ar", "llvm-ar"]);
         run(Command::new(&ar).args(["rcs"]).arg(&lib).arg(&obj));
     }
 
     println!("cargo:rustc-link-lib=static=kvstore");
     println!("cargo:rustc-link-search=native={}", out_dir.display());
+}
+
+fn tool(env_var: &str, candidates: &[&str]) -> String {
+    if let Ok(configured) = std::env::var(env_var) {
+        if !configured.is_empty() {
+            return configured;
+        }
+    }
+    for candidate in candidates {
+        let found = Command::new(candidate)
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if found {
+            return (*candidate).to_string();
+        }
+    }
+    panic!("no {env_var} tool found among {candidates:?}; set {env_var}");
 }
 
 fn run(command: &mut Command) {

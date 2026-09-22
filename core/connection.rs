@@ -445,6 +445,10 @@ pub struct Connection {
     /// PRAGMA count_changes: when ON, each INSERT, UPDATE and DELETE returns
     /// one row with the number of rows it changed.
     pub(super) count_changes: AtomicBool,
+    /// PRAGMA fts_merge_threshold: number of visible FTS index segments a
+    /// statement flush may leave behind before the write path merges them.
+    /// 0 disables write-path merging.
+    pub(super) fts_merge_threshold: AtomicI64,
     /// SQLite DQS misfeature: when ON (default), unresolved double-quoted identifiers
     /// in DML statements fall back to string literals instead of raising an error.
     pub(super) dqs_dml: AtomicBool,
@@ -3602,7 +3606,7 @@ impl Connection {
                             init.db.open_flags,
                             init.db.durable_storage.clone(),
                             enc_ctx,
-                            init.db.mv_store_allocator.clone(),
+                            init.db.allocators.mv_store.clone(),
                             init.db.experimental_mvcc_passive_checkpoint_enabled(),
                         )?;
                         init.db.mv_store.store(Some(mv_store));
@@ -3767,24 +3771,34 @@ impl Connection {
     /// (temp + attached).The internal locks are released before `f` runs, which also
     /// makes it safe for `f` to call back into the connection (e.g. `mv_store_for_db`,
     /// which re-reads the attached-database catalog).
+    #[inline(always)]
     pub(crate) fn with_all_attached_pagers_with_index<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&[(usize, Arc<Pager>)]) -> R,
     {
-        if !self.has_non_main_pagers.load(Ordering::Acquire) {
-            return f(&[]);
-        }
-        let mut pagers: SmallVec<[(usize, Arc<Pager>); 8]> = SmallVec::new();
-        if let Some(temp_db) = self.temp.database.read().as_ref() {
-            pagers.push((crate::TEMP_DB_ID, temp_db.pager.clone()));
-        }
+        return if !self.has_non_main_pagers.load(Ordering::Acquire) {
+            f(&[])
+        } else {
+            attach_all_pagers_cold(self, f)
+        };
+
+        #[inline(never)]
+        fn attach_all_pagers_cold<F, R>(conn: &Connection, f: F) -> R
+        where
+            F: FnOnce(&[(usize, Arc<Pager>)]) -> R,
         {
-            let catalog = self.attached_databases.read();
-            for (&idx, entry) in catalog.index_to_data.iter() {
-                pagers.push((idx, entry.pager.clone()));
+            let mut pagers: SmallVec<[(usize, Arc<Pager>); 8]> = SmallVec::new();
+            if let Some(temp_db) = conn.temp.database.read().as_ref() {
+                pagers.push((crate::TEMP_DB_ID, temp_db.pager.clone()));
             }
+            {
+                let catalog = conn.attached_databases.read();
+                for (&idx, entry) in catalog.index_to_data.iter() {
+                    pagers.push((idx, entry.pager.clone()));
+                }
+            }
+            f(&pagers)
         }
-        f(&pagers)
     }
 
     pub(crate) fn database_schemas(&self) -> &RwLock<HashMap<usize, Arc<Schema>>> {
@@ -3942,6 +3956,14 @@ impl Connection {
 
     pub fn get_dml_require_where(&self) -> bool {
         self.dml_require_where.load(Ordering::SeqCst)
+    }
+
+    pub fn get_fts_merge_threshold(&self) -> i64 {
+        self.fts_merge_threshold.load(Ordering::SeqCst)
+    }
+
+    pub fn set_fts_merge_threshold(&self, value: i64) {
+        self.fts_merge_threshold.store(value, Ordering::SeqCst);
     }
 
     pub fn set_dml_require_where(&self, value: bool) {
@@ -4810,8 +4832,8 @@ impl Connection {
     }
 
     /// Get the query timeout duration.
-    pub fn get_query_timeout(&self) -> Duration {
-        Duration::from_millis(self.query_timeout_ms.load(Ordering::SeqCst))
+    pub fn get_query_timeout_ms(&self) -> u64 {
+        self.query_timeout_ms.load(Ordering::SeqCst)
     }
 
     /// Get a reference to the busy handler.

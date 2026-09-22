@@ -180,7 +180,7 @@ enum TrimType {
 
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
-        self.cast_text()
+        self.cast_text_ref()
             .map(|s| Value::build_text(s.to_ascii_lowercase()))
     }
 
@@ -208,7 +208,7 @@ impl Value {
     }
 
     pub fn exec_upper(&self) -> Option<Self> {
-        self.cast_text()
+        self.cast_text_ref()
             .map(|s| Value::build_text(s.to_ascii_uppercase()))
     }
 
@@ -286,11 +286,15 @@ impl Value {
         Value::build_text(result)
     }
 
+    #[expect(
+        clippy::unnecessary_lazy_evaluations,
+        reason = "ok_or skips the drop glue that otherwise bloats the happy path"
+    )]
     pub fn exec_abs(&self) -> Result<Self> {
         Ok(match self {
             Value::Null => Value::Null,
             Value::Numeric(Numeric::Integer(v)) => {
-                Value::from_i64(v.checked_abs().ok_or(LimboError::IntegerOverflow)?)
+                Value::from_i64(v.checked_abs().ok_or_else(|| LimboError::IntegerOverflow)?)
             }
             Value::Numeric(Numeric::Float(non_nan)) => Value::from_f64(f64::from(*non_nan).abs()),
             _ => {
@@ -543,8 +547,8 @@ impl Value {
                 return Value::from_slice(&b[start..end]);
             }
             (value, Value::Numeric(Numeric::Integer(start))) => {
-                if let Some(text) = value.cast_text() {
-                    let s = sqlite_text_prefix(text.as_str());
+                if let Some(text) = value.cast_text_ref() {
+                    let s = sqlite_text_prefix(&text);
                     // Use character count to accurately resolve negative offsets in UTF-8 strings
                     let char_count = s.chars().count();
                     let (mut start, mut end) =
@@ -649,7 +653,7 @@ impl Value {
         match self {
             Value::Null => Value::Null,
             _ => match ignored_chars {
-                None => match self.cast_text() {
+                None => match self.cast_text_ref() {
                     Some(text) => {
                         let input = &text[0..text.find('\0').unwrap_or(text.len())];
                         let mut bytes = crate::alloc::vec![0; input.len() / 2];
@@ -1250,15 +1254,18 @@ impl Value {
             return Ok(Value::Blob(blob));
         }
 
-        let Some(lhs) = self.cast_text() else {
+        let Some(lhs) = self.cast_text_ref() else {
             return Ok(Value::Null);
         };
 
-        let Some(rhs) = rhs.cast_text() else {
+        let Some(rhs) = rhs.cast_text_ref() else {
             return Ok(Value::Null);
         };
 
-        Ok(Value::build_text(lhs + &rhs))
+        let mut joined = String::with_capacity(lhs.len() + rhs.len());
+        joined.push_str(&lhs);
+        joined.push_str(&rhs);
+        Ok(Value::build_text(joined))
     }
 
     pub fn exec_and(&self, rhs: &Value) -> Value {
@@ -1383,7 +1390,7 @@ impl Value {
             }
             result = Some(match result {
                 None => v,
-                Some(cur) if v < cur => v,
+                Some(cur) if v <= cur => v,
                 Some(cur) => cur,
             });
         }

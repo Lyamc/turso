@@ -24,6 +24,7 @@ use crate::{
             EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE,
             EXPLAIN_QUERY_PLAN_JSON_COLUMNS_TYPE,
         },
+        ProgramStep,
     },
     Connection, EqpFormat, LimboError, MvStore, Pager, QueryMode, Result, TransactionState, Value,
     EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS, EXPLAIN_QUERY_PLAN_JSON_COLUMNS,
@@ -519,14 +520,10 @@ impl Statement {
         }
         let timeout = match self.query_timeout_override {
             Some(timeout_override) => timeout_override,
-            None => {
-                let connection_timeout = self.program.connection.get_query_timeout();
-                if connection_timeout.is_zero() {
-                    None
-                } else {
-                    Some(connection_timeout)
-                }
-            }
+            None => match self.program.connection.get_query_timeout_ms() {
+                0 => None,
+                millis => Some(Duration::from_millis(millis)),
+            },
         };
         let Some(timeout) = timeout else {
             return;
@@ -571,14 +568,24 @@ impl Statement {
                 return Ok(result);
             }
         }
-        let res = self
-            .program
-            .step(&mut self.state, &self.pager, self.query_mode, waker);
-        if let Ok(StepResult::Row) = res {
-            self.busy = true;
-            self.has_returned_row = true;
-            return Ok(StepResult::Row);
-        }
+        let res = match self.query_mode {
+            QueryMode::Normal => {
+                match self
+                    .program
+                    .normal_step(&mut self.state, &self.pager, waker)
+                {
+                    ProgramStep::Row => {
+                        self.busy = true;
+                        self.has_returned_row = true;
+                        return Ok(StepResult::Row);
+                    }
+                    step => step.into(),
+                }
+            }
+            _ => self
+                .program
+                .step(&mut self.state, &self.pager, self.query_mode, waker),
+        };
         self.finish_step(res, waker)
     }
 
@@ -1447,7 +1454,7 @@ impl Statement {
         }
         conn.set_mv_tx_for_db(pending.db, pending.saved_outer);
         // When the inner tx aborted via the vdbe's catch-all error path
-        // (e.g. DatabaseFull on sequence exhaustion), rollback_current_txn_state
+        // (e.g. SequenceExhausted), rollback_current_txn_state
         // rolled back what mv_tx pointed at — the inner — and set
         // auto_commit=true under the assumption it was the only live tx.
         // Restoring mv_tx to the outer without also restoring auto_commit=false
@@ -1507,7 +1514,12 @@ impl Statement {
 
         let mut reset_error: Option<LimboError> = None;
 
-        if let Some(io) = self.state.io_completions.take() {
+        let in_flight = self
+            .state
+            .io_completions
+            .take()
+            .filter(|io| !io.0.is_wait());
+        if let Some(io) = in_flight {
             if let Err(err) = io.wait(self.pager.io.as_ref()) {
                 capture_reset_error(
                     &mut reset_error,
@@ -1861,6 +1873,45 @@ mod tests {
         assert_eq!(metrics.btree_table_seeks, 1);
         assert_eq!(metrics.btree_index_seeks, 1);
         assert_eq!(metrics.btree_deferred_seeks, 1);
+    }
+
+    #[test]
+    fn test_correlated_subquery_runs_after_selective_join() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE outer_rows(id INTEGER PRIMARY KEY, allowed_id INTEGER)")
+            .unwrap();
+        conn.execute("CREATE TABLE allowed(id INTEGER PRIMARY KEY, enabled INTEGER)")
+            .unwrap();
+        conn.execute("CREATE TABLE inner_rows(outer_id INTEGER, value INTEGER)")
+            .unwrap();
+        conn.execute("CREATE INDEX inner_outer_id ON inner_rows(outer_id)")
+            .unwrap();
+        conn.execute("INSERT INTO allowed VALUES (1, 0), (2, 1)")
+            .unwrap();
+        conn.execute("INSERT INTO outer_rows VALUES (1, 1), (2, 1), (3, 2)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO inner_rows
+             SELECT id, CASE WHEN id = 3 THEN 0 ELSE id END FROM outer_rows",
+        )
+        .unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT o.id
+                 FROM outer_rows o CROSS JOIN allowed a
+                 WHERE a.id = o.allowed_id
+                   AND a.enabled = 1
+                   AND EXISTS (
+                       SELECT 1 FROM inner_rows i
+                       WHERE i.outer_id = o.id AND i.value <> o.id
+                   )",
+            )
+            .unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+
+        assert_eq!(rows, vec![vec![Value::from_i64(3)]]);
+        assert_eq!(stmt.metrics().btree_index_seeks, 1);
     }
 
     #[test]

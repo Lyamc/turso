@@ -211,6 +211,17 @@ fn emit_table_list_rows_for_schema(
     }
 }
 
+/// SQLite matches PRAGMA names without regard to case.
+fn parse_pragma_name(name: &str) -> Option<PragmaName> {
+    if let Ok(pragma) = PragmaName::from_str(name) {
+        return Some(pragma);
+    }
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        return PragmaName::from_str(&name.to_ascii_lowercase()).ok();
+    }
+    None
+}
+
 pub fn translate_pragma(
     resolver: &Resolver,
     name: &ast::QualifiedName,
@@ -227,7 +238,7 @@ pub fn translate_pragma(
         return Ok(());
     }
 
-    let Ok(pragma) = PragmaName::from_str(name.name.as_str()) else {
+    let Some(pragma) = parse_pragma_name(name.name.as_str()) else {
         // SQLite silently ignores unknown PRAGMA names.
         return Ok(());
     };
@@ -694,6 +705,16 @@ fn update_pragma(
         }
         PragmaName::MvccGroupCommit => {
             connection.set_mvcc_group_commit(parse_pragma_enabled(&value))?;
+            Ok(TransactionMode::None)
+        }
+        PragmaName::FtsMergeThreshold => {
+            let threshold = match parse_signed_number(&value)? {
+                Value::Numeric(Numeric::Integer(size)) if size >= 0 => size,
+                _ => bail_parse_error!(
+                    "fts_merge_threshold must be 0 (disabled) or a positive integer"
+                ),
+            };
+            connection.set_fts_merge_threshold(threshold);
             Ok(TransactionMode::None)
         }
         PragmaName::ForeignKeys => {
@@ -1623,6 +1644,14 @@ fn query_pragma(
             let enabled = connection.mvcc_group_commit()?;
             let register = program.alloc_register();
             program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::FtsMergeThreshold => {
+            let threshold = connection.get_fts_merge_threshold();
+            let register = program.alloc_register();
+            program.emit_int(threshold, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)

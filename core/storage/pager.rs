@@ -572,7 +572,7 @@ impl PageInner {
     pub fn cell_table_leaf_read_header(&self, idx: usize) -> crate::Result<TableLeafCellHeader> {
         turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
         let buf = self.as_ptr();
-        let cell_pointer_array_start = self.header_size();
+        let cell_pointer_array_start = LEAF_PAGE_HEADER_SIZE_BYTES;
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         // Bound-check the array entry: `idx` is the untrusted on-disk cell count.
         crate::assert_or_bail_corrupt!(
@@ -595,7 +595,7 @@ impl PageInner {
     }
 
     /// Returns a cell's record payload and overflow info without constructing
-    /// a `BTreeCell`.
+    /// a [BTreeCell].
     ///
     /// This bypasses the full `cell_get()` to `read_btree_cell()` path for
     /// record reads and index binary-search hot loops.
@@ -617,12 +617,12 @@ impl PageInner {
     #[inline(always)]
     pub fn cell_read_payload_at(
         &self,
-        idx: usize,
+        cell_idx: usize,
         limits: PayloadLimits,
     ) -> crate::Result<(&'static [u8], usize, u64, Option<u32>)> {
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_pointer = cell_pointer_array_start + (cell_idx * CELL_PTR_SIZE_BYTES);
         let cell_offset = self.read_u16(cell_pointer) as usize;
 
         let page_type = self.page_type()?;
@@ -650,14 +650,13 @@ impl PageInner {
             }
         };
 
-        let (overflows, local_size) = sqlite3_ondisk::payload_overflows(
-            payload_size as usize,
-            limits.max_local(page_type),
-            limits.min_local,
-            limits.usable_size,
-        );
-
-        let (payload_slice, first_overflow) = if overflows {
+        let (payload_slice, first_overflow) = if let Some(local_size) =
+            sqlite3_ondisk::payload_overflows(
+                payload_size as usize,
+                limits.max_local(page_type),
+                limits.min_local,
+                limits.usable_size,
+            ) {
             let overflow_ptr_offset = payload_start + local_size - 4;
             crate::assert_or_bail_corrupt!(
                 overflow_ptr_offset + 4 <= buf.len(),
@@ -760,14 +759,13 @@ impl PageInner {
             PageType::IndexInterior => {
                 let (len_payload, n_payload) =
                     read_varint(crate::slice_in_bounds_or_corrupt!(buf, start + 4..))?;
-                let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
+                if let Some(local_size) = sqlite3_ondisk::payload_overflows(
                     len_payload as usize,
                     max_local,
                     min_local,
                     usable_size,
-                );
-                if overflows {
-                    4 + to_read + n_payload
+                ) {
+                    4 + local_size + n_payload
                 } else {
                     4 + len_payload as usize + n_payload
                 }
@@ -780,14 +778,13 @@ impl PageInner {
             PageType::IndexLeaf => {
                 let (len_payload, n_payload) =
                     read_varint(crate::slice_in_bounds_or_corrupt!(buf, start..))?;
-                let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
+                if let Some(local_size) = sqlite3_ondisk::payload_overflows(
                     len_payload as usize,
                     max_local,
                     min_local,
                     usable_size,
-                );
-                if overflows {
-                    to_read + n_payload
+                ) {
+                    local_size + n_payload
                 } else {
                     let mut size = len_payload as usize + n_payload;
                     if size < MINIMUM_CELL_SIZE {
@@ -801,14 +798,13 @@ impl PageInner {
                     read_varint(crate::slice_in_bounds_or_corrupt!(buf, start..))?;
                 let (_, n_rowid) =
                     read_varint(crate::slice_in_bounds_or_corrupt!(buf, start + n_payload..))?;
-                let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
+                if let Some(local_size) = sqlite3_ondisk::payload_overflows(
                     len_payload as usize,
                     max_local,
                     min_local,
                     usable_size,
-                );
-                if overflows {
-                    to_read + n_payload + n_rowid
+                ) {
+                    local_size + n_payload + n_rowid
                 } else {
                     let mut size = len_payload as usize + n_payload + n_rowid;
                     if size < MINIMUM_CELL_SIZE {
@@ -1013,15 +1009,6 @@ impl Page {
     #[inline]
     pub fn is_loaded(&self) -> bool {
         self.get().flags.load(Ordering::Acquire) & PAGE_LOADED != 0
-    }
-
-    /// `is_loaded` for a check that needs no ordering: the caller already
-    /// synchronized with the load of the page, so a relaxed read cannot
-    /// see the flag unset. Unlike the acquire read, it lets the compiler
-    /// keep values it read before the check in registers across it.
-    #[inline]
-    pub fn is_loaded_relaxed(&self) -> bool {
-        self.get().flags.load(Ordering::Relaxed) & PAGE_LOADED != 0
     }
 
     #[inline]
@@ -3167,14 +3154,13 @@ impl Pager {
         self.schema_cookie.store(value, Ordering::SeqCst);
     }
 
-    /// Get the schema cookie, using the cached value if available to avoid reading page 1.
     pub fn get_schema_cookie(&self) -> IOResultOr<u32> {
-        // Try to use cached value first
-        if let Some(cookie) = self.get_schema_cookie_cached() {
-            return Ok(IOResult::Done(cookie));
-        }
-        // If not cached, read from header and cache it
-        self.with_header(|header| header.schema_cookie.get())
+        self.with_header(|header| {
+            if self.db_initialized() {
+                self.set_reserved_space(header.reserved_space);
+            }
+            header.schema_cookie.get()
+        })
     }
 
     /// This connection's frozen WAL position `(checkpoint_seq, max_frame)` — the read mark for a
@@ -3203,7 +3189,7 @@ impl Pager {
     }
 
     #[inline(always)]
-    #[instrument(skip_all, level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     pub fn begin_read_tx(&self) -> Result<()> {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
@@ -3444,7 +3430,7 @@ impl Pager {
         }
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     pub fn end_read_tx(&self) {
         let Some(wal) = self.wal.as_ref() else {
             return;
@@ -3565,7 +3551,7 @@ impl Pager {
     /// `page_idx` arbitrarily many times. Each `Some(page_idx)` mapping in
     /// `pending_reads` corresponds to a single outstanding disk read; the
     /// entry is removed exactly when this method returns `Done`.
-    #[tracing::instrument(skip_all, level = Level::TRACE)]
+    #[cfg_attr(debug_assertions, tracing::instrument(skip_all, level = Level::TRACE))]
     pub fn read_page(&self, page_idx: i64) -> IOResultOr<(PageRef, Option<Completion>)> {
         self.read_page_into(page_idx, None)
     }
@@ -4800,9 +4786,12 @@ impl Pager {
             );
         }
         if header.page_number == 1 {
-            let db_size = self
-                .io
-                .block(|| self.with_header(|header| header.database_size))?;
+            let db_size = self.io.block(|| {
+                self.with_header(|header| {
+                    self.set_reserved_space(header.reserved_space);
+                    header.database_size
+                })
+            })?;
             tracing::debug!("truncate page_cache as first page was written: {}", db_size);
             let mut page_cache = self.page_cache.write();
             page_cache.truncate(db_size.get() as usize).map_err(|e| {
@@ -5923,10 +5912,7 @@ impl Pager {
                     // Check if allocating a new page would exceed the maximum page count
                     let max_page_count = self.get_max_page_count();
                     if new_db_size > max_page_count {
-                        return Err(LimboError::DatabaseFull(
-                            "database or disk is full".to_string(),
-                        )
-                        .into());
+                        return Err(LimboError::DatabaseFull.into());
                     }
 
                     // FIXME: should reserve page cache entry before modifying the database
